@@ -35,6 +35,27 @@ def test_fork_ci_preserves_native_hosts_and_test_selection():
                 if workers is not None:
                     (step,) = [s for s in job["steps"] if "HERMES_TEST_WORKERS" in s.get("env", {})]
                     assert str(evaluate(step["env"]["HERMES_TEST_WORKERS"], {}, {}, github=context)) == str(workers)
+    (release_refs,) = [s for s in docs["tests.yml"]["jobs"]["e2e-upgrade"]["steps"]
+                       if s.get("name") == "Fetch official release refs for fork upgrade fixtures"]
+    assert evaluate(release_refs["if"], {}, {}, github={"repository": fork}) is True
+    assert evaluate(release_refs["if"], {}, {}, github={"repository": upstream}) is False
+    assert release_refs["run"].strip() == (
+        "git fetch --no-tags https://github.com/NousResearch/hermes-agent.git "
+        "'refs/tags/v20*:refs/tags/v20*'")
+    assert docs["tests.yml"]["jobs"]["e2e-upgrade"]["steps"].index(release_refs) == 1
+    (js_step,) = [s for s in docs["js-tests.yml"]["jobs"]["check"]["steps"]
+                  if s.get("name") == "Run all workspace checks"]
+    command, expression = js_step["run"].split("${{", 1)
+    assert command.strip() == "node .github/scripts/run-workspace-checks.mjs"
+    assert evaluate("${{" + expression, {}, {}, github={"repository": fork}) == "--concurrency 1"
+    assert evaluate("${{" + expression, {}, {}, github={"repository": upstream}) == ""
+    for name, job_id, fork_minutes, upstream_minutes in (
+            ("tests.yml", "test", 150, 30),
+            ("tests.yml", "e2e", 120, 30),
+            ("windows-install-update-e2e.yml", "install-update", 100, 50)):
+        timeout = docs[name]["jobs"][job_id]["timeout-minutes"]
+        assert evaluate(timeout, {}, {}, github={"repository": fork}) == fork_minutes, (name, job_id)
+        assert evaluate(timeout, {}, {}, github={"repository": upstream}) == upstream_minutes, (name, job_id)
     os_job = docs["tests-os.yml"]["jobs"]["os-tests"]
     rows = os_job["strategy"]["matrix"]["include"]
     assert [(r["marker"], r["runner"]) for r in rows] == [

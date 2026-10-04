@@ -87,4 +87,5 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Each check has its own CPU-sized pool; four checks overcommit a 4-core fork runner.
+        run: node .github/scripts/run-workspace-checks.mjs ${{ github.repository == 'leonardsellem/hermes-agent' && '--concurrency 1' || '' }}

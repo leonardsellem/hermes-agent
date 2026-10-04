@@ -29,7 +29,9 @@ jobs:
     name: Windows install.ps1 + hermes update E2E
     runs-on: ${{ github.repository == 'leonardsellem/hermes-agent' && 'windows-latest' || 'windows-latest-32-core' }}
     # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: 50
+    # The 4-vCPU fork runner projected ~73 min (75% of the journeys at 45 min, run 37221466119):
+    # the 50 min cap can only cancel it mid-suite. Upstream keeps 50.
+    timeout-minutes: ${{ github.repository == 'leonardsellem/hermes-agent' && 100 || 50 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
