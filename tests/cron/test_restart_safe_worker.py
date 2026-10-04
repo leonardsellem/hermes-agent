@@ -1236,3 +1236,94 @@ def test_restart_wait_counts_exclude_only_scoped_workers(tmp_path, monkeypatch):
     keys = {scheduler._inflight_key(job_id) for job_id in jobs}
     assert not keys & scheduler._scope_isolated_job_ids
     assert not keys & set(scheduler._running_worker_pids)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.live_system_guard_bypass
+def test_oom_killed_tool_child_does_not_kill_restart_safe_worker(tmp_path, monkeypatch):
+    """A 576 MiB child crosses a 512 MiB worker cap; only the child dies."""
+    import cron.executions as executions
+    import cron.scheduler as scheduler
+    from cron.jobs import create_job, get_job, remove_job, use_cron_store
+    from tools import process_registry as pr
+
+    if not pr._systemd_run_user_scope_available():
+        pytest.skip("systemd-run --user --scope is unavailable on this host")
+    if not pr._systemd_scope_oom_policy_supported("systemd-run"):
+        pytest.skip("OOMPolicy=continue is unsupported on this host (#102486 below 253)")
+
+    home = tmp_path / "profile"
+    scripts = home / "scripts"
+    scripts.mkdir(parents=True)
+    receipt = tmp_path / "oom-receipt.json"
+    script = scripts / "oom_probe.py"
+    script.write_text(
+        "import json, pathlib, shlex, subprocess, sys\n"
+        "from tools.environments.local import LocalEnvironment, in_hermes_worker_scope\n"
+        "from tools.process_registry import systemd_user_bus_env\n"
+        "assert in_hermes_worker_scope()\n"
+        "path = next(line[3:] for line in pathlib.Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))\n"
+        "unit = pathlib.PurePosixPath(path).name\n"
+        "cg = pathlib.Path('/sys/fs/cgroup') / path.lstrip('/')\n"
+        "properties = subprocess.check_output(['systemctl', '--user', 'show', unit, '-p', 'OOMPolicy', '-p', 'MemoryMax'], env=systemd_user_bus_env(), text=True)\n"
+        "before = (cg / 'memory.events').read_text()\n"
+        "worker_score = pathlib.Path('/proc/self/oom_score_adj').read_text().strip()\n"
+        "env = LocalEnvironment(cwd=str(pathlib.Path(__file__).parent), timeout=20)\n"
+        "child = \"import pathlib; print('child_score=' + pathlib.Path('/proc/self/oom_score_adj').read_text().strip(), flush=True); bytearray(576 * 1024 * 1024)\"\n"
+        "try:\n"
+        "    result = env.execute(shlex.quote(sys.executable) + ' -c ' + shlex.quote(child), timeout=20)\n"
+        "finally:\n"
+        "    env.cleanup()\n"
+        "after = (cg / 'memory.events').read_text()\n"
+        "assert result['returncode'] == 137, result\n"
+        "assert 'child_score=500' in result['output'], result\n"
+        "assert 'Killed' in result['output'], result\n"
+        "assert 'OOMPolicy=continue' in properties and 'MemoryMax=536870912' in properties, properties\n"
+        "data = {'unit': unit, 'properties': properties, 'worker_score': worker_score, 'before': before, 'after': after, 'result': result}\n"
+        f"pathlib.Path({str(receipt)!r}).write_text(json.dumps(data))\n"
+        "print(result['output'], flush=True)\n"
+        "print(json.dumps({'v': 1, 'job': 'oom-containment-drill', 'outcome': 'ok', 'should_retry': False, 'backlog_drain': False, 'reason_code': 'published', 'note': 'child_exit=137 worker_survived=true'}), flush=True)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("INVOCATION_ID", "oom-fixture")
+    monkeypatch.setenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "512")
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    started_at = time.time()
+    with use_cron_store(home):
+        job = create_job(
+            prompt=None, schedule="every 1h", name="bounded OOM probe",
+            script=script.name, interpreter=sys.executable, no_agent=True,
+            deliver="local", failure_deliver=None,
+        )
+        try:
+            assert scheduler.run_one_job(job, adapters=None, loop=None)
+            row = executions.latest_execution(job["id"])
+            assert row is not None and row["status"] == "completed", row
+            data = json.loads(receipt.read_text())
+            events = lambda text: dict(line.split() for line in text.splitlines())
+            assert int(events(data["after"])["oom_kill"]) > int(events(data["before"])["oom_kill"])
+            outputs = list((home / "cron/output" / job["id"]).glob("*.md"))
+            assert len(outputs) == 1
+            transcript = tmp_path / "oom-output.md"
+            transcript.write_text(outputs[0].read_text())
+            contract = json.loads(transcript.read_text().strip().splitlines()[-1])
+            assert contract["v"] == 1 and contract["outcome"] == "ok"
+            journal = subprocess.run(
+                ["journalctl", "--user", "-u", data["unit"], "--since", "@" + str(int(started_at)), "--no-pager"],
+                env=pr.systemd_user_bus_env(), capture_output=True, text=True, timeout=5,
+            )
+            data.update(execution=row, output_path=str(transcript), contract=contract, journal=journal.stdout, journal_rc=journal.returncode)
+            receipt.write_text(json.dumps(data, indent=2))
+            # The child OOM is logged; the containing scope must not fail with oom-kill.
+            assert "Failed with result 'oom-kill'" not in journal.stdout
+            print("OOM_DRILL_RECEIPT=" + str(receipt))
+            print(json.dumps(data, sort_keys=True))
+        finally:
+            pr._stop_systemd_unit(f"hermes-worker-cron-{job['id']}-exec-{job.get('execution_id', '')}.scope")
+            assert remove_job(job["id"])
+            assert get_job(job["id"]) is None
+            if receipt.exists():
+                data = json.loads(receipt.read_text())
+                data["job_removed"] = True
+                receipt.write_text(json.dumps(data, indent=2))

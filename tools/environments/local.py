@@ -31,6 +31,30 @@ from tools.environments.local_pythonpath import (
 
 
 _IS_WINDOWS = platform.system() == "Windows"
+_IS_LINUX = platform.system() == "Linux"
+
+
+def in_hermes_worker_scope() -> bool:
+    """Only tools inside a bounded Hermes worker should be preferred OOM victims."""
+    if not _IS_LINUX:
+        return False
+    try:
+        return any(
+            line.startswith("0::") and re.search(r"/hermes-worker-[^/]+\.scope$", line)
+            for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+        )
+    except OSError:
+        return False
+
+
+def raise_child_oom_score_adj() -> None:
+    """Pre-exec: prefer killing the tool child over its worker, best effort."""
+    if _IS_LINUX:
+        try:
+            Path("/proc/self/oom_score_adj").write_text("500", encoding="ascii")
+        except OSError:
+            pass
+
 
 logger = logging.getLogger(__name__)
 
@@ -1003,6 +1027,7 @@ class LocalEnvironment(BaseEnvironment):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
+            preexec_fn=raise_child_oom_score_adj if in_hermes_worker_scope() else None,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):

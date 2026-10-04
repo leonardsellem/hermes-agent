@@ -25,7 +25,10 @@ _IS_WINDOWS = platform.system() == "Windows"
 # (not merely "not Windows") so macOS and other POSIX platforms never touch systemd.
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env,
+    in_hermes_worker_scope, raise_child_oom_score_adj,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
@@ -102,6 +105,9 @@ WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 _SYSTEMD_SCOPE_AVAILABLE: Optional[bool] = None
 _SYSTEMD_SCOPE_PROBE_LOCK = threading.Lock()
 _SYSTEMD_SCOPE_PROBED_AT = 0.0
+_SYSTEMD_OOM_POLICY_AVAILABLE: Optional[bool] = None
+_SYSTEMD_OOM_POLICY_PROBED_AT = 0.0
+_SYSTEMD_OOM_POLICY_PROBE_LOCK = threading.Lock()
 # Both verdicts expire: the user bus can vanish after a True (session logout without linger,
 # #110803) and reappear after a False (linger enabled later, #104893).
 _SYSTEMD_SCOPE_PROBE_TTL_SECONDS = 60.0
@@ -164,15 +170,39 @@ def _worker_memory_max_bytes() -> int:
     return min(override_bound, safe_bound) if override_bound else safe_bound
 
 
+def _systemd_scope_oom_policy_supported(binary: str) -> bool:
+    """#102486: scopes reject OOMPolicy only below systemd 253; probe acceptance."""
+    global _SYSTEMD_OOM_POLICY_AVAILABLE, _SYSTEMD_OOM_POLICY_PROBED_AT
+    if not _IS_LINUX:
+        return False
+    with _SYSTEMD_OOM_POLICY_PROBE_LOCK:
+        if (_SYSTEMD_OOM_POLICY_AVAILABLE is not None
+                and time.monotonic() - _SYSTEMD_OOM_POLICY_PROBED_AT < _SYSTEMD_SCOPE_PROBE_TTL_SECONDS):
+            return _SYSTEMD_OOM_POLICY_AVAILABLE
+        try:
+            result = subprocess.run(
+                [binary, "--user", "--scope", "--quiet", "--collect",
+                 "--unit", f"hermes-probe-oom-{os.getpid()}-{uuid.uuid4().hex[:8]}",
+                 "--property", "OOMPolicy=continue", "--", "/bin/sh", "-c", "exit 0"],
+                capture_output=True, timeout=3, env=systemd_user_bus_env(),
+            )
+            supported = result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            supported = False
+        _SYSTEMD_OOM_POLICY_AVAILABLE = supported
+        _SYSTEMD_OOM_POLICY_PROBED_AT = time.monotonic()
+        return supported
+
+
 def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
-    ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
-    No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486)."""
+    ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl."""
+    properties = ["--property", "OOMPolicy=continue"] if _systemd_scope_oom_policy_supported(binary) else []
     return [
         binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
-        "--", *argv,
+        *properties, "--", *argv,
     ]
 
 
@@ -1314,7 +1344,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # hang waiting for `q` — default them to cat, honoring any pager the user set.
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
-        pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
+        pty_kwargs: Dict[str, Any] = (
+            {"preexec_fn": raise_child_oom_score_adj} if in_hermes_worker_scope() else {})
+        pty_proc = _PtyProcessCls.spawn(
+            pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120), **pty_kwargs)
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
         session._pty = pty_proc
@@ -1355,7 +1388,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         ) from e
                     session.systemd_unit = ""
         # Pipe path (non-PTY or PTY fallback).
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs: Dict[str, Any] = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
         spawn_argv = self._scope_argv(session, safe_command, unit_suffix, "Local")
         spawn_env = self._spawn_env(env_vars)
@@ -1369,7 +1402,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         proc = subprocess.Popen(
             spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
             errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True, **_popen_kwargs)
+            start_new_session=True,
+            preexec_fn=raise_child_oom_score_adj if in_hermes_worker_scope() else None,
+            **_popen_kwargs)
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
