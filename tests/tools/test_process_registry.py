@@ -28,7 +28,7 @@ def registry():
 
 
 @pytest.fixture(autouse=True)
-def _reset_systemd_scope_cache():
+def _reset_systemd_scope_cache(monkeypatch):
     """Reset the cached ``systemd-run --user --scope`` availability flag
     before each test so a probe run on a real systemd host (where
     ``INVOCATION_ID`` is set) doesn't leak into tests that mock
@@ -38,6 +38,8 @@ def _reset_systemd_scope_cache():
 
     original = _pr._SYSTEMD_SCOPE_AVAILABLE
     _pr._SYSTEMD_SCOPE_AVAILABLE = False
+    monkeypatch.setattr(_pr, "_SYSTEMD_OOM_POLICY_AVAILABLE", False, raising=False)
+    monkeypatch.setattr(_pr, "_SYSTEMD_OOM_POLICY_PROBED_AT", _pr.time.monotonic(), raising=False)
     yield
     _pr._SYSTEMD_SCOPE_AVAILABLE = original
 
@@ -2171,11 +2173,14 @@ class TestSystemdCgroupIsolation:
         return fake_popen, captured
 
     @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("supported", [True, False])
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
-        self, registry, monkeypatch, _gateway_identity
+        self, registry, monkeypatch, _gateway_identity, supported
     ):
         """Under a supervisor with systemd-run available, the spawn argv is
         wrapped in ``systemd-run --user --scope --unit=hermes-worker-<id>``."""
+        import tools.process_registry as pr
+        monkeypatch.setattr(pr, "_SYSTEMD_OOM_POLICY_AVAILABLE", supported)
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
@@ -2213,10 +2218,9 @@ class TestSystemdCgroupIsolation:
             if value == "--property"
         ]
         assert "MemoryAccounting=yes" in properties
-        # systemd rejects OOMPolicy= on transient --scope units across the versions
-        # users run (239/245/249, #102486); emitting it fails the probe and every
-        # cron worker dispatch. MemoryMax + MemoryAccounting carry the isolation.
-        assert not any(p.startswith("OOMPolicy=") for p in properties), properties
+        # #102486: only systemd <253 rejects OOMPolicy on scopes; keep the
+        # property absent on unsupported hosts, not on every host.
+        assert ("OOMPolicy=continue" in properties) is supported, properties
         memory_max = next(
             value for value in properties if value.startswith("MemoryMax=")
         )
@@ -2605,8 +2609,9 @@ class TestSystemdCgroupIsolation:
         assert session.id not in registry._running
 
     @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("supported", [True, False])
     def test_systemd_run_user_scope_available_caches_after_probe(
-        self, registry, monkeypatch
+        self, registry, monkeypatch, supported
     ):
         """The availability check probes once and caches — a second call must
         not re-probe (and must return the same value)."""
@@ -2614,6 +2619,7 @@ class TestSystemdCgroupIsolation:
 
         # Reset the cache.
         monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr(pr, "_SYSTEMD_OOM_POLICY_AVAILABLE", supported)
         probe_calls = []
 
         def fake_run(*args, **kwargs):
@@ -2628,12 +2634,10 @@ class TestSystemdCgroupIsolation:
         assert first is True
         assert second is True
         assert len(probe_calls) == 1, "probe must run only once (cached)"
-        # The probe must not carry OOMPolicy= either: that is the argv systemd
-        # rejected on scope units and cached as "unavailable" (#102486).
+        # #102486: reject the property only below 253. A supported scope probe
+        # and the worker argv share the same conditional property.
         probe_argv = probe_calls[0][0]
-        assert not any(
-            value.startswith("OOMPolicy=") for value in probe_argv if isinstance(value, str)
-        ), probe_argv
+        assert ("OOMPolicy=continue" in probe_argv) is supported, probe_argv
 
     @pytest.mark.platforms("linux")
     def test_successful_systemd_probe_revalidates_after_cache_ttl(self, monkeypatch):
@@ -3140,3 +3144,78 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("accepted", [True, False, None])
+def test_scope_oom_policy_acceptance_is_cached_and_expires(monkeypatch, accepted):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "_SYSTEMD_OOM_POLICY_AVAILABLE", None)
+    clock = [100.0]
+    monkeypatch.setattr(pr.time, "monotonic", lambda: clock[0])
+    calls = []
+
+    def probe(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["timeout"] == 3
+        assert "OOMPolicy=continue" in argv
+        if accepted is None:
+            raise subprocess.TimeoutExpired(argv, 3)
+        return subprocess.CompletedProcess(argv, 0 if accepted else 1)
+
+    monkeypatch.setattr(pr.subprocess, "run", probe)
+    for suffix in ("cron-test", "kanban-test"):
+        argv = pr._systemd_scope_argv("/usr/bin/systemd-run", "hermes-worker-" + suffix, "/bin/sh", "-c", "exit 0")
+        assert ("OOMPolicy=continue" in argv) is (accepted is True)
+    assert len(calls) == 1
+    clock[0] += pr._SYSTEMD_SCOPE_PROBE_TTL_SECONDS + 1
+    pr._systemd_scope_argv("/usr/bin/systemd-run", "hermes-worker-test", "/bin/sh", "-c", "exit 0")
+    assert len(calls) == 2
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("cgroup, expected", [
+    ("0::/user.slice/hermes-worker-cron-test.scope\n", True),
+    ("0::/user.slice/hermes-worker-kanban-test.scope\n", True),
+    ("0::/user.slice/hermes-worker-test.scope/nested\n", False),
+    ("0::/system.slice/hermes-gateway.service\n", False),
+    ("1:memory:/hermes-worker-test.scope\n", False),
+])
+def test_child_oom_guard_requires_exact_unified_worker_scope(monkeypatch, cgroup, expected):
+    from tools.environments import local
+
+    monkeypatch.setattr(local.Path, "read_text", lambda *_a, **_k: cgroup)
+    assert local.in_hermes_worker_scope() is expected
+    monkeypatch.setattr(local.Path, "read_text", lambda *_a, **_k: (_ for _ in ()).throw(OSError("missing proc")))
+    assert local.in_hermes_worker_scope() is False
+    monkeypatch.setattr(local.Path, "write_text", lambda *_a, **_k: (_ for _ in ()).throw(OSError("read only proc")))
+    local.raise_child_oom_score_adj()  # Best effort must never prevent exec.
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("in_worker, expected", [(True, "500"), (False, "0")])
+def test_pipe_child_oom_score_adj(registry, tmp_path, monkeypatch, in_worker, expected):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "in_hermes_worker_scope", lambda: in_worker)
+    monkeypatch.setattr(pr, "_find_shell", lambda: "/bin/bash")
+    session = registry.spawn_local("cat /proc/self/oom_score_adj", cwd=str(tmp_path))
+    session._reader_thread.join(timeout=10)
+    assert session.exited and session.exit_code == 0
+    assert session.output_buffer.strip() == expected
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("in_worker, expected", [(True, "500"), (False, "0")])
+def test_pty_child_oom_score_adj(registry, tmp_path, monkeypatch, in_worker, expected):
+    pytest.importorskip("ptyprocess")
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "in_hermes_worker_scope", lambda: in_worker)
+    monkeypatch.setattr(pr, "_find_shell", lambda: "/bin/bash")
+    session = registry.spawn_local("cat /proc/self/oom_score_adj", cwd=str(tmp_path), use_pty=True)
+    session._reader_thread.join(timeout=10)
+    assert session._pty is not None, "PTY must not silently fall back to pipes"
+    assert session.exited and session.exit_code == 0
+    assert session.output_buffer.strip() == expected
