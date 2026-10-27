@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholder_row
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.error_classifier import FailoverReason
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message, without_persistence_fields
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
@@ -47,6 +48,7 @@ from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, OPEN_TURN_TAIL_ROL
 from agent.turn_final_response import finish_text_response
 from agent.turn_finalizer import finalize_turn
 from agent.turn_iteration_prep import (
+    _inject_steer_after_newest_tool_result,
     announce_api_call,
     apply_retry_restarts,
     begin_iteration,
@@ -1534,6 +1536,7 @@ class _LoopState:
     _llm_middleware_trace: Any = None
     api_duration: Any = None
     assistant_message: Any = None
+    reason: Any = None  # handle_api_error's classified FailoverReason for this attempt
 
 
 # _LoopState fields seeded from TurnContext (same name minus the leading underscore).
@@ -1599,6 +1602,20 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
                 return _ae.result
             if _ae.action == "break":
                 return None
+            # A same-provider resend crosses no iteration boundary, so the steer typed while
+            # the request was in flight would otherwise wait for the whole retry ladder.
+            if _ae.reason in (FailoverReason.timeout, FailoverReason.overloaded):
+                _steer = agent._drain_pending_steer()
+                if _steer:
+                    _before = len(s.messages)
+                    _inject_steer_after_newest_tool_result(agent, s.messages, _steer)
+                    if len(s.messages) > _before:
+                        logger.info(
+                            "%sDelivered /steer to agent before resend (%d chars): %s",
+                            agent.log_prefix, len(_steer), _steer[:60],
+                        )
+                    # The attempt is rebuilt from s.messages: carry the new row into the request.
+                    _run_phase(assemble_api_request, agent, s)
     return None
 
 

@@ -47,6 +47,7 @@ class ApiErrorVerdict:
     compression_attempts: Any
     _provider_overflow_recovery_pending: Any
     result: Optional[dict[str, Any]] = None
+    reason: Optional[FailoverReason] = None
 
 
 def handle_api_error(
@@ -61,6 +62,9 @@ def handle_api_error(
     the retry loop with ``restart_with_rebuilt_messages`` armed (``"break"``) so the pre-API
     preflight re-runs against the fallback's context window (#84733)."""
     _provider_overflow_recovery_pending = False
+    # Initialised before the first ``_verdict`` call site: the closure reads it on the
+    # pre-classification paths, which would otherwise raise UnboundLocalError.
+    _reason: Optional[FailoverReason] = None
 
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ApiErrorVerdict:
         return ApiErrorVerdict(
@@ -69,6 +73,7 @@ def handle_api_error(
             approx_tokens=approx_tokens, retry_count=retry_count, max_retries=max_retries,
             compression_attempts=compression_attempts,
             _provider_overflow_recovery_pending=_provider_overflow_recovery_pending, result=result,
+            reason=_reason,
         )
 
     # Stop spinner silently — retry status is buffered and only flushed when every
@@ -128,6 +133,7 @@ def handle_api_error(
         base_url=str(getattr(agent, "base_url", "") or ""),
         api_key=getattr(agent, "api_key", None),
     )
+    _reason = classified.reason
     logger.debug(
         "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
         classified.reason.value, classified.status_code,

@@ -1692,6 +1692,7 @@ class ClassifiedErrorVerdict:
     is_rate_limited: bool
     wrapped_output_cap_budget: Optional[int]
     is_zai_coding_overload: bool
+    reason: Optional[FailoverReason] = None
 
 
 _OVERFLOW_REASONS = frozenset({
@@ -1837,6 +1838,7 @@ def route_classified_error(
             provider_overflow_recovery_pending=_provider_overflow_recovery_pending,
             is_rate_limited=is_rate_limited, wrapped_output_cap_budget=_wrapped_output_cap_budget,
             is_zai_coding_overload=_is_zai_coding_overload,
+            reason=classified.reason,
         )
 
     def _fallback_break() -> ClassifiedErrorVerdict:
