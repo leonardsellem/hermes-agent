@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,10 +11,10 @@ import { expect, it, vi } from 'vitest'
 
 import { submitPrompt } from '../app/submissionCore.js'
 import { captureDestination } from '../app/submissionDestination.js'
-import { getUiState, resetUiState } from '../app/uiStore.js'
+import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import { useSessionLifecycle } from '../app/useSessionLifecycle.js'
 import { useQueue } from '../hooks/useQueue.js'
-import { loadPendingInputs } from '../lib/pendingInputs.js'
+import { loadPendingInputs, savePendingInput } from '../lib/pendingInputs.js'
 
 async function coldResume(legacy: boolean) {
   const home = mkdtempSync(join(tmpdir(), 'ink-cold-native-'))
@@ -57,7 +58,8 @@ async function coldResume(legacy: boolean) {
     lifecycle.resumeById('S')
     await vi.waitFor(() => expect(getUiState().sid).toBe('R2'))
     expect(queue.queueRef.current.map(item => item.text)).toEqual(['ambiguous', 'waiting'])
-    expect(queue.dequeue()).toBeUndefined()
+    // The retained head is not sendable, but it no longer holds the row behind it.
+    expect(queue.dequeue()?.text).toBe('waiting')
     const attempted = queue.queueRef.current[0]!
     expect(attempted.destination).toMatchObject({ sid: 'R1', storedSid: 'S' })
     expect(queue.queueRef.current[1]!.destination).toMatchObject({ sid: 'R2', storedSid: 'S' })
@@ -69,13 +71,19 @@ async function coldResume(legacy: boolean) {
     const submissions = request.mock.calls.filter(([method]) => method === 'prompt.submit')
 
     if (legacy) {
-      expect(submissions).toEqual([])
-      expect(queue.queueRef.current[0]).toMatchObject({ failed: true, legacyAttempted: true })
+      // The gesture is the only way out of a receipt-less attempt, and it re-admits the words under a
+      // new identity instead of replaying the request that was already refused.
+      expect(submissions).toEqual([['prompt.submit', { session_id: 'R2', submission_id: item.submissionId, text: 'frozen payload', queued: true }]])
+      expect(item.submissionId).not.toBe(attempted.submissionId)
+      // The dead record is retired and the re-admitted one was delivered: only the later row remains.
+      expect(loadPendingInputs({ ...captureDestination(), profileHome: home }).map(record => record.text))
+        .toEqual(['waiting'])
     } else {
       expect(submissions).toEqual([['prompt.submit', { session_id: 'R2', submission_id: item.submissionId, text: 'frozen payload', queued: true }]])
       expect(item.destination).toMatchObject({ sid: 'R1', storedSid: 'S' })
       expect(queue.queueRef.current.map(pending => pending.text)).toEqual(['waiting'])
-      expect(queue.dequeue()!.destination?.sid).toBe('R2')
+      // Both rows are claimed now (the ambiguous one settled, the later one sent by the drain).
+      expect(queue.dequeue()).toBeUndefined()
     }
   } finally {
     instance.unmount()
@@ -87,3 +95,41 @@ async function coldResume(legacy: boolean) {
 
 it('cold-resumes native queued and ambiguous records by durable identity with a live retry target', async () => coldResume(false))
 it('cold recovery excludes foreign identities and never replays an ambiguous legacy attempt', async () => coldResume(true))
+
+it('cold-resume-with-ambiguous-head-still-drains-later-rows', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ink-cold-head-'))
+  vi.stubEnv('HERMES_HOME', home)
+  resetUiState()
+  const destination = { profile: 'default', profileHome: home, sid: 'R1', storedSid: 'S' }
+
+  const save = (text: string, createdAt: number, patch: Record<string, unknown> = {}) =>
+    savePendingInput({ createdAt, destination, display: text, submissionId: randomUUID(), text, ...patch } as never)
+
+  save('LS3827-HEAD', 0, { inFlight: true, legacyAttempted: true })
+  save('LS3827-A', 1)
+  save('LS3827-B', 2)
+  patchUiState({ info: { profile_name: 'default', stored_session_id: 'S' } as never, sid: 'R1' })
+
+  let queue!: ReturnType<typeof useQueue>
+
+  function Harness() {
+    queue = useQueue()
+
+    return <Text>{queue.queuedDisplay.join('|')}</Text>
+  }
+
+  const instance = renderSync(<Harness />, { stdin: new PassThrough() as any,
+    stdout: Object.assign(new PassThrough(), { columns: 80, isRow: false, isTTY: false, rows: 20 }) as any,
+    stderr: new PassThrough() as any, patchConsole: false })
+
+  try {
+    expect(queue.dequeue()?.text).toBe('LS3827-A')
+    expect(queue.dequeue()?.text).toBe('LS3827-B')
+    expect(queue.queueRef.current[0]).toMatchObject({ failed: true, text: 'LS3827-HEAD' })
+    expect(loadPendingInputs(captureDestination()).map(record => record.text)).toContain('LS3827-HEAD')
+  } finally {
+    instance.unmount()
+    vi.unstubAllEnvs()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
