@@ -116,6 +116,37 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().busy).toBe(false)
   })
 
+  it('gateway.ready pre-session catalog load uses the rejecting request', async () => {
+    const ctx = buildCtx([])
+    ctx.gateway.gw.request.mockImplementation((method: string) => method === 'commands.catalog'
+      ? Promise.reject(new Error('request timed out after 120s: commands.catalog'))
+      : Promise.resolve(null))
+
+    createGatewayEventHandler(ctx)({ type: 'gateway.ready', payload: {} } as any)
+    await vi.waitFor(() => expect(getTurnState().activity).toHaveLength(1))
+
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith('commands.catalog', {})
+    expect(ctx.gateway.rpc.mock.calls.some(([method]: [string]) => method === 'commands.catalog')).toBe(false)
+    expect(ctx.system.sys).not.toHaveBeenCalledWith(expect.stringContaining('did not answer'))
+    expect(getTurnState().activity[0]?.text).toContain('command catalog unavailable: Hermes did not answer within 120s')
+  })
+
+  it('skills.changed catalog load uses the rejecting request', async () => {
+    const ctx = buildCtx([])
+    ctx.gateway.gw.request.mockImplementation((method: string) => method === 'commands.catalog'
+      ? Promise.reject(new Error('request timed out after 120s: commands.catalog'))
+      : Promise.resolve(null))
+    patchUiState({ sid: 'owner' })
+
+    createGatewayEventHandler(ctx)({ type: 'skills.changed', payload: {} })
+    await vi.waitFor(() => expect(getTurnState().activity).toHaveLength(1))
+
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith('commands.catalog', { session_id: 'owner' })
+    expect(ctx.gateway.rpc.mock.calls.some(([method]: [string]) => method === 'commands.catalog')).toBe(false)
+    expect(ctx.system.sys).not.toHaveBeenCalledWith(expect.stringContaining('did not answer'))
+    expect(getTurnState().activity[0]?.text).toContain('command catalog unavailable: Hermes did not answer within 120s')
+  })
+
   it('an idle snapshot a frame ahead of the final leaves the tool trail for the final to archive', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
@@ -1427,6 +1458,7 @@ describe('createGatewayEventHandler', () => {
   it('keeps gateway noise informational and approval out of Activity', async () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)
+    ctx.gateway.gw.request.mockRejectedValue(new Error('cold start'))
     ctx.gateway.rpc = vi.fn(async () => {
       throw new Error('cold start')
     })
