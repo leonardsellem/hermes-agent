@@ -636,7 +636,8 @@ export function useMainApp(gw: GatewayClient) {
   )
 
   const gateway = useMemo(() => ({ gw, rpc }), [gw, rpc])
-  const catalog = useSlashCatalog(rpc)
+  const catalogRequest = useMemo(() => gw.request.bind(gw), [gw])
+  const catalog = useSlashCatalog(catalogRequest)
 
   const { die, dieWithCode, exitClose } = useDie(gw, exit)
 
