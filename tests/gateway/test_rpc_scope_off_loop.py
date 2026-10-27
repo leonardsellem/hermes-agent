@@ -150,6 +150,9 @@ async def test_real_projection_paused_while_the_session_is_retired_is_not_found(
     session_ancillary, connection, ref, lock = _ancillary_fixture(
         monkeypatch, on_enter=lambda: holder["authority"].sessions.pop("s1"))
     holder["authority"] = connection.authority
+    # The store reads happen before the lock (a separate step); this test pauses the locked projection.
+    monkeypatch.setattr(session_ancillary, "_prefetch_ancillary",
+                        lambda authority, ref, kind: (ref.session_id, None, frozenset()))
     with pytest.raises(AuthorityRefusal) as exc:
         await session_ancillary.read(connection, ref, {"session_id": "s1", **params}, kind=kind)
     assert str(exc.value) == "not_found"
