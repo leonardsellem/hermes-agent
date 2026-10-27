@@ -127,7 +127,7 @@ export const versionSkewMessage = (): string => t('userMessages.rpc.versionSkew'
 
 const SESSION_NOT_FOUND_RE = /session not found/i
 const NOT_CONNECTED_RE = /^gateway not (?:connected|running)\b/
-const TIMED_OUT_RE = /^request timed out after (\d+)s/
+const TIMED_OUT_RE = /^request timed out after (\d+)s(?::\s*(\S+))?/
 
 type RpcErrorRow = [
   matcher: (code: number | undefined, text: string) => RegExpExecArray | boolean | null,
@@ -148,7 +148,7 @@ const RPC_ERROR_ROWS: RpcErrorRow[] = [
   [(_code, text) => NOT_CONNECTED_RE.test(text), () => t('userMessages.rpc.notConnected')],
   [(_code, text) => UNAVAILABLE_METHOD_RE.exec(text), m => t('userMessages.rpc.methodUnavailable', m?.[1] ?? '?')],
   [(_code, text) => text.trim() === 'launch_credentials_unavailable', () => t('userMessages.rpc.launchCredentialsChanged')],
-  [(_code, text) => TIMED_OUT_RE.exec(text), m => t('userMessages.rpc.timedOut', m?.[1] ?? '?')]
+  [(_code, text) => TIMED_OUT_RE.exec(text), m => t('userMessages.rpc.timedOut', m?.[1] ?? '?', m?.[2] ?? 'the request')]
 ]
 
 let rpcErrorLogSink: ((line: string) => void) | null = null
