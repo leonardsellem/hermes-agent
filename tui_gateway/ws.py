@@ -100,7 +100,15 @@ _WS_DISPATCH_QUEUE_MAX = 256
 # transcript, so running them through the serial control lane turns an inexpensive interrupt or
 # control read behind them into a client timeout.  Keep the exception deliberately narrow: mutating
 # RPCs still retain arrival order, and no more than two expensive reads consume a connection.
-_WS_CONCURRENT_READ_METHODS = frozenset({"session.context_breakdown"})
+# The TUI's 1.5 s background polls join them: they only project owned state too, so a slow one
+# must never precede an operator's control request. Mutating RPCs stay on the serial lane.
+_WS_CONCURRENT_READ_METHODS = frozenset({
+    "session.context_breakdown",
+    "subagent.list",
+    "process.list",
+    "session.list",
+    "session.active_list",
+})
 _WS_CONCURRENT_READ_LIMIT = 2
 # Reads admitted beyond the running ones; one more parks the reader (as the serial lane did).
 _WS_WAITING_READ_LIMIT = 8
@@ -412,6 +420,12 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
     authority_connection = None
     messages = parse_errors = dispatch_crashes = send_failures = 0
     disconnect_reason = "not_connected"
+    # Requests accepted onto the dispatch queue and not yet finished, with their accept time on the
+    # monotonic clock: id(req) is unique for exactly that window, since the queue or its dispatcher
+    # task holds the dict until then. Snapshot at disconnect, never at the close line: the drain
+    # finishes queued frames after the client left, so live counters would read 0.
+    unanswered: dict[int, float] = {}
+    unanswered_count, oldest_wait_s = 0, 0.0
 
     async def _reply(frame: dict, reason: str, msg: str, *args: Any) -> None:
         """write_async; on failure record *reason*, log *msg* and end the read loop."""
@@ -446,17 +460,27 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         # writes the response itself via transport.write (a separate thread, so that is the safe
         # path). Inline handlers return the response dict, written here from the loop.
         try:
-            resp = await _dispatch_request(authority_connection, req, req_method, transport)
-        # health: allow BLE001 -- dispatch boundary: logs the traceback (_log.exception) and answers -32603
-        except Exception:
-            dispatch_crashes += 1
-            _log.exception("ws dispatch crash peer=%s id=%s method=%s", peer, req_id, req_method)
-            await _reply(_error(-32603, "internal error", req_id), "send_failed_after_dispatch_crash",
-                         "ws dispatch-crash reply send failed peer=%s id=%s method=%s", peer, req_id, req_method)
-            return
-        if resp is not None:
-            await _reply(resp, "send_failed_after_response",
-                         "ws response send failed peer=%s id=%s method=%s", peer, req_id, req_method)
+            try:
+                resp = await _dispatch_request(authority_connection, req, req_method, transport)
+            # health: allow BLE001 -- dispatch boundary: logs the traceback (_log.exception) and answers -32603
+            except Exception:
+                dispatch_crashes += 1
+                _log.exception("ws dispatch crash peer=%s id=%s method=%s", peer, req_id, req_method)
+                await _reply(_error(-32603, "internal error", req_id), "send_failed_after_dispatch_crash",
+                             "ws dispatch-crash reply send failed peer=%s id=%s method=%s", peer, req_id, req_method)
+                return
+            if resp is not None:
+                await _reply(resp, "send_failed_after_response",
+                             "ws response send failed peer=%s id=%s method=%s", peer, req_id, req_method)
+        finally:
+            # Finished: inline reply written, crash reply written, or handed to the legacy pool.
+            unanswered.pop(id(req), None)
+
+    def _unanswered_snapshot() -> tuple[int, float]:
+        """Unanswered requests and the age of the oldest one, sampled when the connection ends."""
+        if not unanswered:
+            return 0, 0.0
+        return len(unanswered), asyncio.get_running_loop().time() - min(unanswered.values())
 
     async def _dispatch_concurrent_read(req: Any) -> None:
         async with concurrent_read_slots:
@@ -507,6 +531,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             # when its task ends (a read cancelled before it ran releases it too).
             await _unless_dispatch_failed(read_admission.acquire())
         await _unless_dispatch_failed(pending.put(req))
+        unanswered[id(req)] = asyncio.get_running_loop().time()
 
     async def _end_reads() -> None:
         """Reads that never started are dropped (their client is gone); started ones finish before the
@@ -580,10 +605,12 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 raise
             except _WebSocketDisconnect as exc:
                 disconnect_reason = f"client_disconnect(code={getattr(exc, 'code', None)},reason={getattr(exc, 'reason', None)})"
+                unanswered_count, oldest_wait_s = _unanswered_snapshot()
                 break
             except Exception:
                 disconnect_reason = "receive_failed"
                 _log.exception("ws receive failed peer=%s", peer)
+                unanswered_count, oldest_wait_s = _unanswered_snapshot()
                 break
             line = raw.strip()
             if not line:
@@ -604,7 +631,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 continue
             await _queue_request(req)
     except _SendFailed:
-        pass
+        unanswered_count, oldest_wait_s = _unanswered_snapshot()
     finally:
         if dispatcher is not None:
             # Finish the in-flight handler and the frames read before the disconnect (as the serial read loop
@@ -648,6 +675,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             _log.debug("ws close failed peer=%s error=%s", peer, exc)
         _log.info(
             "ws closed peer=%s reason=%s messages=%d parse_errors=%d "
-            "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d",
-            peer, disconnect_reason, messages, parse_errors, dispatch_crashes, send_failures, reaped_sessions, detached_sessions,
+            "dispatch_crashes=%d send_failures=%d unanswered=%d oldest_wait_s=%s "
+            "reaped_sessions=%d detached_sessions=%d",
+            peer, disconnect_reason, messages, parse_errors, dispatch_crashes, send_failures,
+            unanswered_count, oldest_wait_s, reaped_sessions, detached_sessions,
         )
