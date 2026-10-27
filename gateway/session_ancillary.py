@@ -19,6 +19,7 @@ _SUBAGENT_FIELDS = (
 )
 _TAIL_BYTES = 16384
 _PROCESS_TAIL_CHARS = 32768  # main's dock tail view (cli_process_dock.process_tail)
+_UNSET = object()  # "not prefetched" — a prefetched None is a real value (no policy, no target)
 
 
 def handlers(connection):
@@ -202,19 +203,38 @@ async def read(connection, ref, params, *, kind):
         raise RuntimeStoreError('not_found')
     authorize(connection, ref, params, 'session:read')
     live = authority.sessions[ref.session_id]
+    # The store and config reads below are I/O. Run them off the loop and before event_stream.lock:
+    # /steer takes that threading lock on the loop, so a read blocked under it freezes the socket.
+    prefetched = (await asyncio.to_thread(_prefetch_ancillary, authority, ref, kind)
+                  if kind in ('processes', 'subagents') else None)
     with live.event_stream.lock:
         if kind == 'control':
             # Persisted per session id, never the route's live objects: readable after a messaging
             # route moved on to another conversation.
             return {'control': control_snapshot(authority, ref)}
-        _require_current_route(authority, ref)
-        agent, records = _owner_objects(authority, ref, include_fallback_evicted=kind == 'subagents')
+        target = prefetched[0] if prefetched is not None else None
+        _require_current_route(authority, ref, target)
+        if prefetched is None:  # tail: unchanged, its objects are already resident
+            agent, records = _owner_objects(authority, ref)
+        else:
+            agent, records = _owner_objects(authority, ref, include_fallback_evicted=kind == 'subagents',
+                                            target=target, policy=prefetched[1], lineage=prefetched[2])
         if kind == 'subagents':
             return {'subagents': [{key: record.get(key) for key in _SUBAGENT_FIELDS}
                                   for record in records], 'delegations': []}
         if kind == 'tail':
             return subagent_tail(records, params['subagent_id'])
-        return {'processes': process_snapshot(authority, ref, agent, records)}
+        return {'processes': process_snapshot(authority, ref, agent, records, target)}
+
+
+def _prefetch_ancillary(authority, ref, kind):
+    """The I/O half of a session projection: physical target, managed-worker policy and (for the
+    roster) the compression lineage. Read off the loop so ``event_stream.lock`` is never held
+    across a store read."""
+    from gateway.session_managed_worker import managed_policy
+    target = physical_target(authority, ref)
+    lineage = _compression_lineage(getattr(authority, 'db', None), target) if kind == 'subagents' else None
+    return target, managed_policy(authority, ref), lineage
 
 
 def _owned_targets(connection, ref, params, *, select):
@@ -381,10 +401,12 @@ def _interrupt_delegations(authority, ref):
                                         parent_session_id=physical_target(authority, ref), reason='/stop')
 
 
-def _require_current_route(authority, ref):
-    """The route still serves this conversation (a reused route must not lend its objects)."""
+def _require_current_route(authority, ref, target=None):
+    """The route still serves this conversation (a reused route must not lend its objects). A
+    prefetched *target* that moved since is read as ``stale_generation``, the fail-closed side."""
     live = authority.sessions[ref.session_id]
-    target = physical_target(authority, ref)
+    if target is None:
+        target = physical_target(authority, ref)
     store = authority.runner.session_store
     with store._lock:
         entry = store._entries.get(live.route)
@@ -392,20 +414,28 @@ def _require_current_route(authority, ref):
             raise RuntimeStoreError('stale_generation')
 
 
-def _owner_objects(authority, ref, *, include_fallback_evicted=False):
+def _owner_objects(authority, ref, *, include_fallback_evicted=False, target=_UNSET, policy=_UNSET,
+                   lineage=_UNSET):
     """``(agent, subagent records)`` of this in-process session. Process-local registries cannot
     describe (or stop) another interpreter's live objects: a managed worker is refused rather than
     answered with an empty success."""
     from gateway.session_managed_worker import managed_policy
-    if managed_policy(authority, ref) is not None:
+    if policy is _UNSET:
+        policy = managed_policy(authority, ref)
+    if policy is not None:
         raise RuntimeStoreError('unsupported_projection')
     agent = authority.agent(ref)
-    session_id = physical_target(authority, ref) if include_fallback_evicted else None
-    route = authority.sessions[ref.session_id].route if include_fallback_evicted else None
-    session_db = getattr(authority, 'db', None) if include_fallback_evicted else None
+    if not include_fallback_evicted:
+        return agent, subagent_records(agent)
+    if target is _UNSET:
+        target = physical_target(authority, ref)
+    session_db = getattr(authority, 'db', None)
+    if lineage is _UNSET:
+        lineage = _compression_lineage(session_db, target)
     return agent, subagent_records(
-        agent, session_id=session_id, session_db=session_db, route=route,
-        include_fallback_evicted=include_fallback_evicted)
+        agent, session_id=target, session_db=session_db,
+        route=authority.sessions[ref.session_id].route,
+        include_fallback_evicted=True, lineage=lineage)
 
 
 def physical_target(authority, ref):
@@ -473,7 +503,8 @@ def _has_fallback_evicted_ancestor(agent, target_sids, expected_db, route, regis
     return False
 
 
-def subagent_records(parent, session_id=None, *, session_db=None, route=None, include_fallback_evicted=True):
+def subagent_records(parent, session_id=None, *, session_db=None, route=None, include_fallback_evicted=True,
+                     lineage=None):
     registry = sys.modules.get('tools.delegate_tool_registry')
     target_sid = (session_id or getattr(parent, 'session_id', None)) if include_fallback_evicted else None
     if registry is None or (parent is None and not target_sid):
@@ -481,7 +512,7 @@ def subagent_records(parent, session_id=None, *, session_db=None, route=None, in
     expected_db = session_db if session_db is not None else getattr(parent, '_session_db', None)
     effective_route = route if route is not None else getattr(parent, 'gateway_session_key', None)
     # A rotating /compress moves the conversation to a new stored id; an evicted parent keeps its earlier one.
-    target_sids = _compression_lineage(expected_db, target_sid)
+    target_sids = _compression_lineage(expected_db, target_sid) if lineage is None else lineage
     with registry._active_subagents_lock:
         return [dict(record) for record in registry._active_subagents.values()
                 if (parent is not None and registry._is_descendant_of(record.get('agent'), parent))
@@ -536,10 +567,11 @@ def subagent_tail(records, subagent_id):
     return {**result, 'available': True, 'text': text, 'truncated': size > _TAIL_BYTES}
 
 
-def _ownership(authority, ref, agent, records):
+def _ownership(authority, ref, agent, records, target=None):
     """``(routing keys, owners)`` a registry process must match to belong to this session: its
     routing key AND an owner among the session, its agent and its subagents."""
-    target = physical_target(authority, ref)
+    if target is None:
+        target = physical_target(authority, ref)
     keys, owners = {authority.sessions[ref.session_id].route, target}, {target}
     if agent is not None:
         owners.add(getattr(agent, 'session_id', None))
@@ -556,12 +588,12 @@ def _owned_locked(registry, keys, owners):
             if p.session_key in keys and (p.owner_task_id or p.task_id) in owners]
 
 
-def process_snapshot(authority, ref, agent, records):
+def process_snapshot(authority, ref, agent, records, target=None):
     module = sys.modules.get('tools.process_registry')
     if module is None:
         return []
     registry = module.process_registry
-    keys, owners = _ownership(authority, ref, agent, records)
+    keys, owners = _ownership(authority, ref, agent, records, target)
     # Keep ownership and output together.
     with registry._lock:
         return [{'session_id': p.id, 'command': p.command[:200],
