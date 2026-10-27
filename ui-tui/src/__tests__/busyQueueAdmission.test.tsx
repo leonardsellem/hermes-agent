@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 
 import { renderSync, Text } from '@hermes/ink'
+import { JsonRpcGatewayError } from '@hermes/shared/json-rpc-channel'
 import { useStore } from '@nanostores/react'
 import React from 'react'
 import { expect, it, vi } from 'vitest'
@@ -24,7 +25,8 @@ const row = (admission_id: string, input_id: string, text: string, status = 'que
   ref: { profile_id: '/tmp/profile', session_id: 'stored-owner' }
 })
 
-function mount(busyInputMode: 'queue' | 'interrupt' | 'steer' = 'queue', cancel: () => Promise<unknown> = () => Promise.resolve({ status: 'terminal', outcome: 'cancelled' })) {
+function mount(busyInputMode: 'queue' | 'interrupt' | 'steer' = 'queue', cancel: () => Promise<unknown> = () => Promise.resolve({ status: 'terminal', outcome: 'cancelled' }),
+  respond?: (method: string, params: any) => unknown) {
   // macOS: tmpdir() is /var/..., a symlink to /private/var; captureDestination() realpaths
   // HERMES_HOME, so receipts must carry the canonical home or target_profile_home never matches.
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'ink-busy-admit-')))
@@ -39,6 +41,13 @@ function mount(busyInputMode: 'queue' | 'interrupt' | 'steer' = 'queue', cancel:
 
   const request = vi.fn((method: string, params: any) => {
     calls.push({ method, params })
+
+    // A steer test scripts the receipted steps; an Error value answers as a rejection.
+    const scripted = respond?.(method, params)
+
+    if (scripted !== undefined) {
+      return scripted instanceof Error ? Promise.reject(scripted) : Promise.resolve(scripted)
+    }
 
     if (method === 'input.detect_drop') { return Promise.resolve({ matched: false }) }
 
@@ -190,16 +199,14 @@ it('never replays an ambiguous non-idempotent busy correction or falls back to q
   try {
     h.request.mockImplementation(async (method, params) => { h.calls.push({ method, params }); throw new Error('invalid_params') })
     h.submission.dispatchSubmission('correction')
-    await expect.poll(() => h.calls.length).toBe(1)
-    expect(h.calls[0]).toMatchObject({ method: 'session.steer', params: { session_id: 'owner', text: 'correction', execution_generation: 1 } })
-    const first = h.calls[0]!.params
     await expect.poll(() => h.queue.queueRef.current[0]?.failed).toBe(true)
-    patchUiState({ busyInputMode: 'interrupt', info: { ...$uiState.get().info!, execution_generation: 2 } })
-    h.submission.sendQueued(h.queue.dequeue(true)!)
     await new Promise(resolve => setImmediate(resolve))
-    expect(h.calls).toEqual([{ method: 'session.steer', params: first }])
-    expect(first).not.toHaveProperty('submission_id')
-    expect(loadPendingInputs(captureDestination())[0]).toMatchObject({ controlMethod: 'session.steer', executionGeneration: 1 })
+    // One admission now carries the attempt; nothing replays it, and no queue fallback hides it.
+    expect(h.calls.map(c => c.method)).toEqual(['prompt.submit'])
+    expect(h.calls[0]!.params).toMatchObject({ session_id: 'owner', text: 'correction', queued: true })
+    expect(h.calls[0]!.params).toHaveProperty('submission_id')
+    expect(loadPendingInputs(captureDestination())[0]).toMatchObject({ settlement: 'indeterminate', text: 'correction' })
+    expect(h.queue.queueRef.current).toHaveLength(1)
   } finally { h.cleanup() }
 })
 
@@ -286,5 +293,144 @@ it('re-admits an edited row to the session it was edited in, even when the user 
     release({ admission_id: 'adm-orig', status: 'terminal', outcome: 'cancelled' })
     await expect.poll(() => h.calls.filter(c => c.method === 'prompt.submit').length).toBe(1)
     expect(h.calls.find(c => c.method === 'prompt.submit')!.params).toMatchObject({ session_id: 'owner', text: 'EDITED_A' })
+  } finally { h.cleanup() }
+})
+
+const refusal = (reason: string) => new JsonRpcGatewayError(reason, { code: 4001, data: { reason } })
+const steerReceipt = (params: any) => ({ admission_id: params.admission_id, status: 'started', outcome: null })
+
+// A busy correction is an admission first and a transfer second: no receipt-less control exists, so
+// a lost or refused steer can always be read back by the identity it was admitted under.
+it('busy-steer-admits-then-steers', async () => {
+  const h = mount('steer', undefined, (method, params) => (method === 'prompt.steer_queued' ? steerReceipt(params) : undefined))
+
+  try {
+    h.submission.dispatchSubmission('next thought')
+    await expect.poll(() => h.calls.map(c => c.method)).toEqual(['prompt.submit', 'prompt.steer_queued'])
+    const [submit, steer] = h.calls
+    expect(submit!.params).toMatchObject({ session_id: 'owner', text: 'next thought', queued: true })
+    expect(typeof submit!.params.submission_id).toBe('string')
+    expect(submit!.params).not.toHaveProperty('execution_generation')
+    expect(steer!.params).toEqual({ session_id: 'owner', admission_id: `adm-${submit!.params.submission_id}` })
+    expect(h.calls.map(c => c.method)).not.toContain('session.steer')
+    // In transfer: the record keeps the admission it was fenced to and no second send follows.
+    expect(loadPendingInputs(captureDestination())[0]).toMatchObject({
+      admissionId: `adm-${submit!.params.submission_id}`, controlMethod: 'prompt.steer_queued', steering: true, text: 'next thought'
+    })
+  } finally { h.cleanup() }
+})
+
+it('late-receipt-settles-delivered', async () => {
+  const h = mount('steer', undefined, (method, params) => {
+    if (method === 'prompt.steer_queued') { return new Error('request timed out after 120s') }
+
+    if (method === 'prompt.receipt') { return { admission_id: params.admission_id, status: 'terminal', outcome: 'steered' } }
+
+    return undefined
+  })
+
+  try {
+    h.submission.dispatchSubmission('next thought')
+    await expect.poll(() => h.calls.map(c => c.method)).toEqual(['prompt.submit', 'prompt.steer_queued', 'prompt.receipt'])
+    await expect.poll(() => h.queue.queueRef.current.length).toBe(0)
+    expect(loadPendingInputs(captureDestination())).toEqual([])
+    // One admission, one steer attempt: the receipt answered for it instead of a resend.
+    expect(h.calls.filter(c => c.method === 'prompt.submit').length).toBe(1)
+    expect(h.calls.filter(c => c.method === 'prompt.steer_queued').length).toBe(1)
+  } finally { h.cleanup() }
+})
+
+it('session-idle-runs-as-next-turn-once', async () => {
+  const h = mount('steer', undefined, method => (method === 'prompt.steer_queued' ? refusal('session_idle') : undefined))
+
+  try {
+    h.submission.dispatchSubmission('next thought')
+    await expect.poll(() => h.calls.filter(c => c.method === 'prompt.submit').length).toBe(1)
+    await expect.poll(() => h.queue.queueRef.current.length).toBe(0)
+    // The admission is the delivery: it runs as the next turn, nothing else is sent.
+    expect(h.calls.map(c => c.method)).toEqual(['prompt.submit', 'prompt.steer_queued'])
+    expect(loadPendingInputs(captureDestination())).toEqual([])
+  } finally { h.cleanup() }
+})
+
+it('unsupported-control-parks-admission-and-sends-nothing', async () => {
+  const h = mount('steer', undefined, method => (method === 'prompt.steer_queued' ? refusal('unsupported_control') : undefined))
+
+  try {
+    h.submission.dispatchSubmission('next thought')
+    await expect.poll(() => h.calls.map(c => c.method)).toEqual(['prompt.submit', 'prompt.steer_queued'])
+    await expect.poll(() => h.queue.queueRef.current[0]?.failed).toBe(true)
+    // Text and place kept, marked for the retry gesture; no receipt read, no second delivery path.
+    expect(loadPendingInputs(captureDestination())[0]).toMatchObject({
+      settlement: 'refused', text: 'next thought'
+    })
+  } finally { h.cleanup() }
+})
+
+const admissionStarted = (receipt: Record<string, unknown>) => (method: string) => {
+  if (method === 'prompt.steer_queued') { return refusal('admission_started') }
+
+  if (method === 'prompt.receipt') { return receipt }
+
+  return undefined
+}
+
+it.each([
+  ['started as its own turn', { status: 'started' }],
+  ['completed', { status: 'terminal', outcome: 'completed' }],
+  ['steered', { status: 'terminal', outcome: 'steered' }],
+  ['back in the queue', { status: 'queued' }]
+])('admission-started-resolves-by-receipt (%s)', async (_name, receipt) => {
+  const h = mount('steer', undefined, admissionStarted(receipt))
+
+  try {
+    h.submission.dispatchSubmission('next thought')
+    await expect.poll(() => h.calls.map(c => c.method)).toEqual(['prompt.submit', 'prompt.steer_queued', 'prompt.receipt'])
+    await expect.poll(() => h.queue.queueRef.current.length).toBe(0)
+    // Delivered by whichever path the receipt names, never re-admitted as a second submission.
+    expect(h.calls.filter(c => c.method === 'prompt.submit').length).toBe(1)
+    expect(h.calls.map(c => c.method)).not.toContain('session.steer')
+    expect(loadPendingInputs(captureDestination())).toEqual([])
+  } finally { h.cleanup() }
+})
+
+it('ambiguous-transport-failure-not-replayed', async () => {
+  const h = mount('steer', undefined, method => (method === 'prompt.submit' ? new Error('request timed out after 120s') : undefined))
+
+  try {
+    h.submission.dispatchSubmission('next thought')
+    await expect.poll(() => h.queue.queueRef.current[0]?.failed).toBe(true)
+    await new Promise(resolve => setImmediate(resolve))
+    expect(h.calls.map(c => c.method)).toEqual(['prompt.submit'])
+    expect(loadPendingInputs(captureDestination())[0]).toMatchObject({ settlement: 'indeterminate', text: 'next thought' })
+  } finally { h.cleanup() }
+})
+
+it('steer-targets-the-session-it-was-typed-in', async () => {
+  const h = mount('steer', undefined, (method, params) => {
+    if (method === 'prompt.steer_queued') { return steerReceipt(params) }
+
+    return undefined
+  })
+
+  try {
+    h.submission.dispatchSubmission('next thought')
+    await expect.poll(() => h.calls.filter(c => c.method === 'prompt.submit').length).toBe(1)
+    // Focus moves after the admission, before the steer lands.
+    patchUiState({ sid: 'session-B', info: { ...$uiState.get().info!, stored_session_id: 'stored-B' } })
+    await expect.poll(() => h.calls.filter(c => c.method === 'prompt.steer_queued').length).toBe(1)
+    expect(h.calls.find(c => c.method === 'prompt.steer_queued')!.params.session_id).toBe('owner')
+  } finally { h.cleanup() }
+})
+
+it('steering-row-is-not-rendered-as-queued', async () => {
+  const h = mount()
+
+  try {
+    h.fanout([{ ...row('adm-transfer', 'in-transfer', 'next thought', 'started'), steering: true }])
+    await expect.poll(() => h.queue.queuedDisplay.length).toBe(1)
+    expect(h.queue.queuedDisplay[0]).toContain('next thought')
+    expect(h.queue.queuedDisplay[0]).toContain('steering')
+    expect(h.queue.queuedDisplay[0]).not.toBe('next thought')
   } finally { h.cleanup() }
 })

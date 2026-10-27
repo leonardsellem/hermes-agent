@@ -4,6 +4,7 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { isServerQueued } from '../app/pendingBubbles.js'
+import { STEER_QUEUED_CONTROL } from '../app/submissionCore.js'
 import { captureDestination, type SubmissionDestination } from '../app/submissionDestination.js'
 import { $uiState, getUiState, patchUiState } from '../app/uiStore.js'
 import { t } from '../i18n/runtime.js'
@@ -15,6 +16,14 @@ import {
   removePendingInput,
   savePendingInput
 } from '../lib/pendingInputs.js'
+import type { SessionInfo } from '../types.js'
+
+type PendingRow = NonNullable<SessionInfo['pending_submissions']>[number]
+
+// An admission in transfer lists as `started` with the steering mark: it is no longer a queued row,
+// but it is not the client's to drain either (LS-3826 U3).
+const steeringRow = (row: PendingRow) => row.status === 'started' && (row as { steering?: boolean }).steering === true
+const listedRow = (row: PendingRow) => isServerQueued(row) || steeringRow(row)
 
 export interface QueueItem {
   display: string
@@ -22,12 +31,18 @@ export interface QueueItem {
   queued?: boolean
   createdAt?: number
   submissionId?: string
+  /** The authority's admission this record carries once it was admitted (a busy correction). */
+  admissionId?: string
   destination?: SubmissionDestination
   ownerDestination?: SubmissionDestination
   inFlight?: boolean
   failed?: boolean
+  /** Set when an attempted record could not be confirmed: it is never sent on its own again. */
+  settlement?: 'indeterminate' | 'refused'
+  /** The admission is in transfer into the running turn, not sitting in the queue. */
+  steering?: boolean
   attachments?: Array<{ path: string; mime: string }>
-  controlMethod?: 'session.steer' | 'session.redirect'
+  controlMethod?: 'prompt.steer_queued' | 'session.steer' | 'session.redirect'
   executionGeneration?: number
   preparedText?: string
   legacyAttempted?: boolean
@@ -210,17 +225,22 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
     [getQueue]
   )
 
-  const serverRows = (ui.info?.pending_submissions ?? []).filter(isServerQueued)
+  const serverRows = (ui.info?.pending_submissions ?? []).filter(listedRow)
 
   const queuedDisplay = [
-    ...queueRef.current.map(item => `${item.failed ? t('canonical.queue.unconfirmedPrefix') : ''}${item.display}`),
-    // A queued row reads as main's plain queue line; only an unknown execution keeps its status tag.
+    // A record in transfer is shown by its server row, in the transfer's own wording.
+    ...queueRef.current
+      .filter(item => !item.steering)
+      .map(item => `${item.failed ? t('canonical.queue.unconfirmedPrefix') : ''}${item.display}`),
+    // A queued row reads as main's plain queue line; only an unknown execution or a transfer keeps a tag.
     ...serverRows.map(row =>
-      row.status === 'queued'
-        ? String(row.user)
-        : row.status === 'unknown'
-          ? t('canonical.queue.lostRow', String(row.user))
-          : t('canonical.queue.serverRow', String(row.status), String(row.user))
+      steeringRow(row)
+        ? t('canonical.queue.steeringRow', String(row.user))
+        : row.status === 'queued'
+          ? String(row.user)
+          : row.status === 'unknown'
+            ? t('canonical.queue.lostRow', String(row.user))
+            : t('canonical.queue.serverRow', String(row.status), String(row.user))
     )
   ]
 
@@ -230,7 +250,7 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
     (index: number) => {
       const local = queueRef.current.length
 
-      return index >= local ? (getUiState().info?.pending_submissions ?? []).filter(isServerQueued)[index - local] : undefined
+      return index >= local ? (getUiState().info?.pending_submissions ?? []).filter(listedRow)[index - local] : undefined
     },
     [queueRef]
   )
@@ -377,6 +397,11 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
       )
 
       if (!item) {
+        continue
+      }
+
+      // A steered record is settled by its receipt, not by the row still being pending.
+      if (item.controlMethod === STEER_QUEUED_CONTROL) {
         continue
       }
 

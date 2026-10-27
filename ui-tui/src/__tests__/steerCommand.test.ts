@@ -49,4 +49,26 @@ describe('/steer', () => {
     expect(enqueue).toHaveBeenCalledWith('check the logs')
     expect(printed).toContain('queued for next turn')
   })
+
+  // On the canonical authority a correction is admitted first and steered by its admission id: the
+  // receipt-less session.steer has no identity to read a lost answer back from.
+  it('admits a busy steer instead of calling session.steer when the authority is canonical', () => {
+    const send = vi.fn()
+    const rpc = vi.fn()
+
+    const ctx = {
+      composer: { enqueue: vi.fn() },
+      gateway: { gw: { isCanonical: true }, rpc },
+      guarded: guarded<unknown>,
+      guardedErr: vi.fn(),
+      sid: 'sid-1',
+      transcript: { send, sys: vi.fn() },
+      ui: { busy: true }
+    }
+
+    findSlashCommand('steer')!.run('check the logs', ctx as never, '/steer check the logs')
+
+    expect(rpc).not.toHaveBeenCalled()
+    expect(send).toHaveBeenCalledWith('check the logs', true, 'check the logs', expect.any(Function), expect.objectContaining({ steer: true }))
+  })
 })

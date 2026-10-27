@@ -127,7 +127,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { attachments?: Array<{ path: string; mime: string }>; skipDetectDrop?: boolean; destination?: SubmissionDestination; queueItem?: QueueItem; behindTurn?: boolean } = {}
+      submitOpts: { attachments?: Array<{ path: string; mime: string }>; skipDetectDrop?: boolean; destination?: SubmissionDestination; queueItem?: QueueItem; behindTurn?: boolean; steer?: boolean } = {}
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
@@ -295,9 +295,18 @@ export function useSubmission(opts: UseSubmissionOptions) {
         const staged = item.settle ? item : composerActions.stage?.(item.text, item.display, destination)
 
         if (!staged) { return }
-        staged.controlMethod ??= mode === 'steer' ? 'session.steer' : 'session.redirect'
-        staged.executionGeneration ??= executionGeneration
+
         staged.attachments ??= item.attachments
+
+        // A correction is an admission first and a transfer second: the owner names it before any
+        // text moves, so a lost answer is read back by identity instead of replayed.
+        if (mode === 'steer') {
+          return send(item.text, true, item.display, value => value, {
+            destination, behindTurn: true, queueItem: staged, attachments: item.attachments, steer: true })
+        }
+
+        staged.controlMethod ??= 'session.redirect'
+        staged.executionGeneration ??= executionGeneration
 
         return send(item.text, true, item.display, value => value, {
           destination, behindTurn: true, queueItem: staged, attachments: item.attachments })

@@ -29,6 +29,7 @@ import {
 import type { Msg, PanelSection } from '../../../types.js'
 import type { StatusBarMode } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
+import { captureDestination } from '../../submissionDestination.js'
 import { patchUiState, sessionCwd } from '../../uiStore.js'
 import { canonicalRewind, canonicalTitle } from '../canonicalSessionCommands.js'
 import type { SlashCommand, SlashRunCtx } from '../types.js'
@@ -852,6 +853,15 @@ export const coreCommands: SlashCommand[] = [
       if (!ctx.ui.busy || !ctx.sid) {
         ctx.composer.enqueue(payload)
         ctx.transcript.sys(t('slashCmd.core.steer.noActiveTurnQueued', previewOf(payload)))
+
+        return
+      }
+
+      // A busy correction takes the typed path: admitted first, then transferred by its admission
+      // id, so a lost or refused steer can be read back instead of vanishing.
+      if (ctx.gateway.gw.isCanonical) {
+        ctx.transcript.send(payload, true, payload, value => value, {
+          behindTurn: true, destination: captureDestination(), steer: true })
 
         return
       }
