@@ -43,7 +43,7 @@ describe('refreshSlashCatalogOnSkillsChange', () => {
     }
 
     await vi.waitFor(() => expect(getTurnState().activity).toHaveLength(1))
-    expect(getTurnState().activity[0]?.text).toContain('command catalog unavailable: Hermes did not answer within 120s')
+    expect(getTurnState().activity[0]?.text).toContain('command catalog unavailable: Hermes did not answer commands.catalog within 120s')
     expect(setCatalog).not.toHaveBeenCalled()
   })
 })

@@ -57,7 +57,7 @@ it('an idle or live catalog timeout visibly renders one deduplicated activity no
 
     const view = mount({ activity: 'expanded' })
 
-    await vi.waitFor(() => expect(view.output()).toContain('command catalog unavailable: Hermes did not answer within 30s'))
+    await vi.waitFor(() => expect(view.output()).toContain('command catalog unavailable: Hermes did not answer commands.catalog within 30s'))
     expect(view.output().match(/command catalog unavailable:/g)).toHaveLength(1)
     expect(getTurnState().activity).toHaveLength(1)
 
