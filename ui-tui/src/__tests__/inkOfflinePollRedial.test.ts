@@ -21,7 +21,9 @@ it('an offline session stops the refresh poll and reports the lost connection on
 
   const gw = Object.assign(new EventEmitter(), {
     attached: true, isCanonical: true, drain: () => {}, getLogTail: () => '', kill: () => {}, recordLog: () => {},
-    request: vi.fn((_method: string) => new Promise(() => {}))
+    // Answered polls: an unanswered tick is dropped by single-flight (LS-3828 U1), so the "is the
+    // poll running" phase needs a gateway that replies. Offline detection below is unaffected.
+    request: vi.fn((_method: string) => Promise.resolve({ delegations: [], processes: [], sessions: [], subagents: [] }))
   })
 
   let app!: ReturnType<typeof useMainApp>

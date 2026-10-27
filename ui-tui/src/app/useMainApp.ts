@@ -21,12 +21,10 @@ import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
 import { SECTION_NAMES, sectionMode } from '../domain/details.js'
 import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
 import { type GatewayClient } from '../gatewayClient.js'
-import type { SubagentListResponse } from '../gatewayTypes.js'
 import type {
   AnyGatewayEvent,
   ClarifyLockResponse,
   ConfigSetResponse,
-  SessionActiveListResponse,
   SessionCloseResponse,
   SharedControlRespondResponse,
   TerminalResizeResponse
@@ -54,13 +52,13 @@ import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type SlashHandler, type StateSetter, type TranscriptRow, type UiState } from './interfaces.js'
-import { requestLiveSessions } from './liveSessions.js'
 import { applyControlSnapshot } from './loopStatus.js'
 import { $overlayState, capturePromptResponseGuard, hasSensitivePrompt, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
-import { applyProcessSnapshot, type ProcessEntry } from './processRoster.js'
+import { applyProcessSnapshot } from './processRoster.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { respondToServerRequest } from './serverRequestStore.js'
+import { createSessionPolls } from './sessionPolls.js'
 import { mutateCanonicalSession } from './slash/canonicalSessionControls.js'
 import { useSlashCatalog } from './slashCatalog.js'
 import { captureDestination, isCurrentDestination, type SubmissionDestination } from './submissionDestination.js'
@@ -708,60 +706,34 @@ export function useMainApp(gw: GatewayClient) {
       })
       .catch(() => {})
 
-    const refresh = () => {
-      const sid = ui.sid
-      gw.request<SubagentListResponse>('subagent.list', { session_id: sid })
-        .then(raw => {
-          const result = asRpcResult<SubagentListResponse>(raw)
+    const polls = createSessionPolls(gw, () => getUiState().sid, {
+      applyAgent: (sid, result) => applyAgentSnapshot(sid, result),
+      applyLiveSessions: (sessions, currentSid) => {
+        const liveSessionCount = sessions.length
 
-          if (!stopped && result && getUiState().sid === sid) {
-            applyAgentSnapshot(sid, result)
-          }
-        })
-        .catch(() => {})
+        // Surface the current session's (auto-)title for the terminal titlebar. The active_list
+        // poll already carries it, so no extra round-trip is needed.
+        const sessionTitle = sessions.find(s => s.current || s.id === currentSid)?.title?.trim() ?? ''
+
+        // Only patch when something actually changed. patchUiState always produces a new state
+        // object, which notifies every $uiState subscriber; patching unconditionally on each 1.5s
+        // poll re-renders the whole TUI and causes idle flicker.
+        const prev = getUiState()
+
+        if (prev.liveSessionCount !== liveSessionCount || prev.sessionTitle !== sessionTitle) {
+          patchUiState({ liveSessionCount, sessionTitle })
+        }
+      },
       // Background processes share the dock with the subagents (Processes block).
-      gw.request<{ processes: ProcessEntry[] }>('process.list', { session_id: sid })
-        .then(raw => {
-          const result = asRpcResult<{ processes: ProcessEntry[] }>(raw)
+      applyProcess: (sid, processes) => applyProcessSnapshot(sid, processes)
+    })
 
-          if (!stopped && result && getUiState().sid === sid) {
-            applyProcessSnapshot(sid, result.processes ?? [])
-          }
-        })
-        .catch(() => {})
-      requestLiveSessions(gw, getUiState().sid)
-        .then(raw => {
-          const result = asRpcResult<SessionActiveListResponse>(raw)
-
-          if (!stopped && result?.sessions) {
-            const liveSessionCount = result.sessions.length
-
-            // Surface the current session's (auto-)title for the terminal
-            // titlebar. The active_list poll already carries it, so no extra
-            // round-trip is needed.
-            const currentSid = getUiState().sid
-
-            const sessionTitle = result.sessions.find(s => s.current || s.id === currentSid)?.title?.trim() ?? ''
-
-            // Only patch when something actually changed. patchUiState always
-            // produces a new state object, which notifies every $uiState
-            // subscriber; patching unconditionally on each 1.5s poll re-renders
-            // the whole TUI and causes idle flicker.
-            const prev = getUiState()
-
-            if (prev.liveSessionCount !== liveSessionCount || prev.sessionTitle !== sessionTitle) {
-              patchUiState({ liveSessionCount, sessionTitle })
-            }
-          }
-        })
-        .catch(() => {})
-    }
-
-    refresh()
-    const timer = setInterval(refresh, 1500)
+    polls.refresh()
+    const timer = setInterval(polls.refresh, 1500)
 
     return () => {
       stopped = true
+      polls.stop()
       clearInterval(timer)
     }
   }, [gw, ui.sid, ui.gatewayConnected])
