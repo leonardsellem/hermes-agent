@@ -87,12 +87,25 @@ describe('describeRpcError', () => {
     }
   })
 
-  it('keeps the timeout seconds but drops the method', () => {
-    const text = describeRpcError(new Error('request timed out after 120s: slash.exec'))
+  it('deadline-names-method-not-model', () => {
+    const logged: string[] = []
 
-    expect(text).toContain('120s')
-    expect(text).not.toContain('slash.exec')
-    expect(text).toContain('/logs')
+    setRpcErrorLogSink(line => {
+      logged.push(line)
+    })
+
+    try {
+      const text = describeRpcError(new Error('request timed out after 120s: session.list'))
+
+      expect(text).toContain('session.list')
+      expect(text).toContain('120s')
+      expect(text).not.toMatch(/model|token/i)
+      expect(text).toContain('/logs')
+      // The wire line the operator can quote stays in /logs.
+      expect(logged.join('\n')).toContain('request timed out after 120s: session.list')
+    } finally {
+      setRpcErrorLogSink(null)
+    }
   })
 
   it('explains a stale session id as saved-and-reopenable, not as loss', () => {
