@@ -9,10 +9,11 @@ import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
 from hermes_state_runtime import (
-    begin_runtime_epoch, claim_session_input, find_session_admission, list_session_admissions,
-    recover_session_inputs,
+    admit_session_input, begin_runtime_epoch, claim_session_input, find_session_admission,
+    list_session_admissions, recover_session_inputs,
 )
-from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
+from gateway.session_contract import Submission
+from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 
 
 class Agent:
@@ -46,10 +47,12 @@ class Turn:
         monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
 
 
-def interactive(db, sid='s', source='gui'):
-    """The session was launched from an interactive local surface (Desktop by default): a local
-    session's row records its frozen launch policy's source."""
-    db._execute_write(lambda conn: conn.execute('UPDATE sessions SET source=? WHERE id=?', (source, sid)))
+def interactive(db, sid='s', source='gui', created=None):
+    """The session was launched from an interactive local surface (Desktop by default): a shared-
+    gateway local session's row keeps ``source='local'`` and records its frozen launch policy's
+    surface in ``created_source`` (a TUI row is ``local`` + ``tui``)."""
+    db._execute_write(lambda conn: conn.execute(
+        'UPDATE sessions SET source=?, created_source=? WHERE id=?', (source, created or source, sid)))
 
 
 def _connection(authority):
@@ -249,3 +252,85 @@ async def test_pending_rows_name_the_controls_the_owner_serves(tmp_path, monkeyp
                                                      for r in authority._pending_rows(REF))}
     assert pending['follower'].get('controls') == ['steer', 'replace']
     assert not pending['head'].get('controls'), 'a started row has no queued-row controls'
+
+
+async def _controls(authority, *texts):
+    """The controls each queued row is offered, by its text, from the pending snapshot a client reads."""
+    for text in texts:
+        await authority.submit(ACTOR, Submission(request_id=text, ref=REF, payload={'text': text}, intent='queue'))
+    return {row['text']: row.get('controls') for row in (asdict(authority._pending_receipt(r))
+                                                        for r in authority._pending_rows(REF))}
+
+
+@pytest.mark.asyncio
+async def test_local_tui_session_is_offered_steer(tmp_path, monkeypatch):
+    """A TUI session is stored source='local' with created_source='tui'; it is offered both verbs and
+    its correction is transferred into the running turn."""
+    db, authority = _authority(tmp_path, monkeypatch)
+    interactive(db, source='local', created='tui')
+    turn, frames = Turn(monkeypatch), []
+    authority.sessions['s'].event_stream.observers.add(frames.append)
+    with db:
+        await _submit(authority, 'running')
+        await asyncio.wait_for(turn.claimed.wait(), 30)
+        queued = await authority.submit(ACTOR, Submission(request_id='correction', ref=REF,
+                                                          payload={'text': 'correction'}, intent='queue'))
+        assert (await _controls(authority))['correction'] == ['steer', 'replace']
+        reply = await _call(_connection(authority), 'prompt.steer_queued', admission_id=queued.admission_id)
+        assert 'error' not in reply, reply
+        assert (reply['result']['status'], reply['result']['outcome']) == ('started', None), reply
+        assert turn.agent.steers == ['correction']
+        turn.release.set()
+        await asyncio.wait_for(authority.sessions['s'].task, 30)
+    assert _ledger(db) == [('running', 'terminal', 'completed'), ('correction', 'terminal', 'steered')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('created', ['cli', 'acp'])
+async def test_local_cli_and_acp_sessions_are_offered_steer(tmp_path, monkeypatch, created):
+    """Every interactive local surface is accepted through created_source, not only the TUI's."""
+    db, authority = _authority(tmp_path, monkeypatch)
+    interactive(db, source='local', created=created)
+    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
+    with db:
+        offered = (await _controls(authority, 'correction'))['correction']
+    assert offered == ['steer', 'replace']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source', ['cron', 'kanban'])
+async def test_cron_and_kanban_stay_unsupported(tmp_path, monkeypatch, source):
+    """A scheduler or board row reads a saved result for every outcome it does not name: never offered,
+    and both verbs still refuse it by name without touching the row."""
+    db, authority = _authority(tmp_path, monkeypatch)
+    interactive(db, source=source)
+    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
+    with db:
+        textual = await _submit(authority, 'scheduled')
+        assert (await _controls(authority))['scheduled'] == []
+        conn = _connection(authority)
+        steer = await _call(conn, 'prompt.steer_queued', admission_id=textual.admission_id)
+        replace = await _call(conn, 'prompt.replace_queued', admission_id=textual.admission_id,
+                              submission_id='edited', text='edited')
+        assert steer['error']['data']['reason'] == 'unsupported_control', steer
+        assert replace['error']['data']['reason'] == 'unsupported_control', replace
+    assert _ledger(db) == [('scheduled', 'queued', None)]
+
+
+@pytest.mark.asyncio
+async def test_attachment_row_stays_unsupported(tmp_path, monkeypatch):
+    """A row carrying an attachment is a whole turn: an interactive local session still offers no
+    control, and a steer cannot drop what it carries."""
+    db, authority = _authority(tmp_path, monkeypatch)
+    interactive(db, source='local', created='tui')
+    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
+    with db:
+        admit_session_input(db, epoch=authority.epoch, principal_id='human', session_id='s',
+                            request_id='shot', payload={
+                                'text': 'look at this',
+                                'attachments': [{'path': '/w/shot.png', 'mime': 'image/png'}]})
+        shot = find_session_admission(db, principal_id='human', session_id='s', request_id='shot')
+        assert (await _controls(authority))['look at this'] == []
+        reply = await _call(_connection(authority), 'prompt.steer_queued', admission_id=shot['admission_id'])
+        assert reply['error']['data']['reason'] == 'unsupported_control', reply
+    assert _ledger(db) == [('shot', 'queued', None)]
