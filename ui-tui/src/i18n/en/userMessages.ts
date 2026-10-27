@@ -49,9 +49,9 @@ export const userMessagesEn = {
         'This chat is no longer attached to the backend (it was idle or the backend restarted). Your history is saved: type /resume to reopen it.',
       notConnected:
         'Hermes is not connected right now, so that was not sent. It reconnects automatically; wait a moment and try again, or type /logs if this persists.',
-      /** `{0}` = timeout in seconds. */
-      timedOut: (secs: string) =>
-        `Hermes did not answer within ${secs}s. Try again; if it keeps happening, type /logs and report the last lines.`,
+      /** `{0}` = timeout in seconds, `{1}` = the client method that missed its deadline. */
+      timedOut: (secs: string, method: string) =>
+        `Hermes did not answer ${method} within ${secs}s. Try again; if it keeps happening, type /logs and report the last lines.`,
       /** `{0}` = slash command name without the slash. */
       slashTimedOut: (command: string) =>
         `/${command} did not finish: the command helper timed out. Try again; if it keeps happening, type /logs and report the last lines.`,
