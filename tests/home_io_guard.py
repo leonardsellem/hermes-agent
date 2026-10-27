@@ -23,6 +23,20 @@ def _pm_generation_dirs(prefixes) -> set[Path]:
     return found
 
 
+def _checkout_git_dirs() -> set[Path]:
+    """A linked worktree's git dir lives in the PRIMARY checkout (``.git/worktrees/<name>``), which
+    for a default install sits inside the real home. Reading ``.git`` is this checkout's own state,
+    like its sources, not the operator's Hermes state."""
+    dot_git = Path(__file__).resolve().parent.parent / ".git"
+    try:
+        text = dot_git.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return set()
+    if not text.startswith("gitdir:"):
+        return set()
+    return {Path(text[len("gitdir:"):].strip()).resolve()}
+
+
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
@@ -42,6 +56,8 @@ _INTERPRETER_PREFIXES = tuple({
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
     Path(__file__).resolve().parent.parent,
+    # The same checkout's git dir; a linked worktree's lives in the primary one.
+    *_checkout_git_dirs(),
 })
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
