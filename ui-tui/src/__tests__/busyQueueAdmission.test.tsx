@@ -359,11 +359,30 @@ it('unsupported-control-parks-admission-and-sends-nothing', async () => {
   try {
     h.submission.dispatchSubmission('next thought')
     await expect.poll(() => h.calls.map(c => c.method)).toEqual(['prompt.submit', 'prompt.steer_queued'])
-    await expect.poll(() => h.queue.queueRef.current[0]?.failed).toBe(true)
-    // Text and place kept, marked for the retry gesture; no receipt read, no second delivery path.
-    expect(loadPendingInputs(captureDestination())[0]).toMatchObject({
-      settlement: 'refused', text: 'next thought'
-    })
+    // The refusal precedes any row touch: the admission is still queued and the FIFO delivers it at
+    // the turn boundary, so the row is neither failed nor handed back to the operator.
+    await expect.poll(() => h.queue.queueRef.current.length).toBe(0)
+    expect(h.queue.queueRef.current[0]?.failed).toBeUndefined()
+    expect(loadPendingInputs(captureDestination())).toEqual([])
+    expect(h.calls.map(c => c.method)).not.toContain('prompt.receipt')
+  } finally { h.cleanup() }
+})
+
+it('steering-row-keeps-server-row-pairing', async () => {
+  const h = mount()
+
+  try {
+    h.queue.enqueue('local one')
+    h.queue.enqueue('local two')
+    h.queue.queueRef.current[0]!.steering = true
+    h.fanout([row('adm-a', 'in-a', 'server A'), row('adm-b', 'in-b', 'server B')])
+
+    // One visible list: the local row in transfer is not addressed, so server rows start right after
+    // the local rows that are shown.
+    await expect.poll(() => h.queue.queuedDisplay).toEqual(['local two', 'server A', 'server B'])
+    expect(h.queue.queueDraft(0)).toBe('local two')
+    expect(h.queue.queueDraft(1)).toBe('server A')
+    expect(h.queue.queueDraft(2)).toBe('server B')
   } finally { h.cleanup() }
 })
 
