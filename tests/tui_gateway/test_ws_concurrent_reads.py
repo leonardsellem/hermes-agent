@@ -6,6 +6,8 @@ The real ``handle_ws`` dispatcher; only ``_dispatch_request`` is a gated async s
 """
 import asyncio
 import json
+import logging
+import re
 
 import pytest
 
@@ -152,3 +154,130 @@ async def test_a_failed_read_reply_does_not_cancel_the_running_control(rig):
     await asyncio.wait_for(task, 10)
     assert "cancelled:submit" not in log and "done:submit" in log
     assert log[-1] == "teardown"
+
+
+@pytest.mark.asyncio
+async def test_poll_methods_dispatch_off_the_control_lane(rig):
+    """poll-methods-dispatch-off-the-control-lane: a parked ``process.list`` never delays a
+    later operator control request on the same connection."""
+    sock, gates, log = rig
+    gates["process.list"] = release = asyncio.Event()
+    gates["session.steer"] = steer_release = asyncio.Event()
+    task = asyncio.create_task(ws_mod.handle_ws(sock))
+    sock.inbound.put_nowait(rpc("poll", "process.list"))
+    assert await settle(lambda: "start:poll" in log)
+    sock.inbound.put_nowait(rpc("steer", "session.steer"))
+    try:
+        assert await settle(lambda: "start:steer" in log), "the poll parked the control lane"
+        steer_release.set()
+        assert await settle(lambda: "done:steer" in log)
+        assert "done:poll" not in log
+    finally:
+        release.set()
+        steer_release.set()
+    sock.inbound.put_nowait(None)
+    await asyncio.wait_for(task, 30)
+
+
+@pytest.mark.asyncio
+async def test_active_list_dispatches_off_the_control_lane(rig):
+    """active-list-dispatches-off-the-control-lane: the non-canonical poll gets the same lane."""
+    sock, gates, log = rig
+    gates["session.active_list"] = release = asyncio.Event()
+    task = asyncio.create_task(ws_mod.handle_ws(sock))
+    sock.inbound.put_nowait(rpc("poll", "session.active_list"))
+    assert await settle(lambda: "start:poll" in log)
+    sock.inbound.put_nowait(rpc("steer", "session.steer"))
+    try:
+        assert await settle(lambda: "done:steer" in log), "the active-list poll parked the control lane"
+        assert "done:poll" not in log
+    finally:
+        release.set()
+    sock.inbound.put_nowait(None)
+    await asyncio.wait_for(task, 30)
+
+
+@pytest.mark.asyncio
+async def test_mutating_methods_stay_serial(rig):
+    """mutating-methods-stay-serial: arrival order, never overlapped, however many reads run."""
+    sock, gates, log = rig
+    gates["process.list"] = poll_release = asyncio.Event()
+    gates["prompt.submit"] = release = asyncio.Event()
+    task = asyncio.create_task(ws_mod.handle_ws(sock))
+    sock.inbound.put_nowait(rpc("poll", "process.list"))
+    assert await settle(lambda: "start:poll" in log)
+    sock.inbound.put_nowait(rpc(1, "prompt.submit"))
+    assert await settle(lambda: "start:1" in log), "a mutating request waited behind a parked poll"
+    sock.inbound.put_nowait(rpc(2, "prompt.submit"))
+    assert not await settle(lambda: "start:2" in log, timeout=0.5), "a mutating request ran while another was in flight"
+    release.set()
+    assert await settle(lambda: "done:2" in log)
+    poll_release.set()
+    sock.inbound.put_nowait(None)
+    await asyncio.wait_for(task, 30)
+    assert [e for e in log if e.endswith((":1", ":2"))] == ["start:1", "done:1", "start:2", "done:2"]
+
+
+def _close_line(caplog):
+    line = next((rec.getMessage() for rec in reversed(caplog.records)
+                 if rec.getMessage().startswith("ws closed peer=")), None)
+    assert line is not None, "no ws close line logged"
+    return line
+
+
+def _unanswered(line):
+    match = re.search(r"unanswered=(\d+) oldest_wait_s=([0-9.eE+-]+)", line)
+    assert match is not None, line
+    return int(match.group(1)), float(match.group(2))
+
+
+@pytest.mark.asyncio
+async def test_close_line_reports_unanswered_and_oldest_wait(rig, caplog):
+    """close-line-reports-unanswered-and-oldest-wait: sampled at disconnect, not after the drain."""
+    caplog.set_level(logging.INFO, logger="tui_gateway.ws")
+    sock, gates, log = rig
+    gates["prompt.submit"] = release = asyncio.Event()
+    task = asyncio.create_task(ws_mod.handle_ws(sock))
+    sock.inbound.put_nowait(rpc(1, "prompt.submit"))
+    assert await settle(lambda: "start:1" in log)
+    sock.inbound.put_nowait(rpc(2, "prompt.submit"))
+    assert await settle(lambda: sock.received == 2)
+    sock.inbound.put_nowait(None)  # the disconnect is detected while 1 runs and 2 waits
+    await asyncio.sleep(0.1)  # let the read loop take its pre-drain snapshot
+    release.set()
+    await asyncio.wait_for(task, 30)
+    assert "done:2" in log  # the drain really did finish both
+    unanswered, oldest = _unanswered(_close_line(caplog))
+    assert unanswered == 2 and oldest > 0
+
+
+@pytest.mark.asyncio
+async def test_close_line_idle_reads_zero(rig, caplog):
+    """close-line-idle-reads-zero: every request answered before the disconnect."""
+    caplog.set_level(logging.INFO, logger="tui_gateway.ws")
+    sock, _gates, log = rig
+    task = asyncio.create_task(ws_mod.handle_ws(sock))
+    sock.inbound.put_nowait(rpc(1))
+    assert await settle(lambda: "done:1" in log)
+    sock.inbound.put_nowait(None)
+    await asyncio.wait_for(task, 30)
+    assert _unanswered(_close_line(caplog)) == (0, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_close_line_carries_no_request_params(rig, caplog):
+    """close-line-carries-no-request-params: counts and identity only, never prompt text."""
+    caplog.set_level(logging.INFO, logger="tui_gateway.ws")
+    sock, gates, log = rig
+    gates["prompt.submit"] = release = asyncio.Event()
+    task = asyncio.create_task(ws_mod.handle_ws(sock))
+    sock.inbound.put_nowait({"jsonrpc": "2.0", "id": 7, "method": "prompt.submit",
+                             "params": {"prompt": "MARKER-prose-must-not-be-logged"}})
+    assert await settle(lambda: "start:7" in log)
+    sock.inbound.put_nowait(None)
+    await asyncio.sleep(0.1)  # let the read loop take its pre-drain snapshot
+    release.set()
+    await asyncio.wait_for(task, 30)
+    line = _close_line(caplog)
+    assert "MARKER-prose-must-not-be-logged" not in line
+    assert "unanswered=1" in line
