@@ -69,7 +69,14 @@ interface SubmitPromptOpts {
   destination?: SubmissionDestination
   queueItem?: QueueItem
   behindTurn?: boolean
+  /** A busy correction: admit it, then transfer it into the running turn by its admission id. */
+  steer?: boolean
 }
+
+/** The control a busy correction's record carries once the owner has named its admission. */
+export const STEER_QUEUED_CONTROL = 'prompt.steer_queued'
+
+export type SteerOutcome = 'delivered' | 'in-transfer' | 'indeterminate' | 'refused'
 
 type PendingOwner = ReturnType<typeof pendingInputOwner>
 
@@ -223,6 +230,184 @@ function settleAdmissionReply(item: QueueItem, r: PromptSubmitResponse, ctx: Adm
     deps.sys(t('canonical.submit.admissionNotConfirmed'))
     patchUiState({ status: t('canonical.submit.statusAdmissionUnconfirmed') })
   }
+}
+
+/** The one settlement table for a steered admission (LS-3826 U2). A `started` receipt alone cannot
+ *  say which start it is: only the pending snapshot's `steering` mark tells a transfer from a turn
+ *  that claimed the row for itself. */
+export function steerOutcome(
+  receipt: { outcome?: null | string; status?: string } | null | undefined,
+  steering: boolean
+): SteerOutcome {
+  if (receipt?.status === 'queued') {
+    return 'delivered'
+  }
+
+  if (receipt?.status === 'started') {
+    return steering ? 'in-transfer' : 'delivered'
+  }
+
+  if (receipt?.status === 'terminal') {
+    if (receipt.outcome === 'completed' || receipt.outcome === 'steered') {
+      return 'delivered'
+    }
+
+    return receipt.outcome === 'cancelled' ? 'refused' : 'indeterminate'
+  }
+
+  return 'indeterminate'
+}
+
+const refusalReason = (error: unknown) =>
+  (error as { data?: { reason?: unknown } } | null)?.data?.reason as string | undefined
+
+// Both refusals leave the row `queued`: the admission is the delivery, and it runs at the boundary.
+const STEER_BOUNDARY_REFUSALS = new Set(['session_idle', 'steer_unavailable'])
+
+function steerSteeringMarked(admissionId: string): boolean {
+  return (getUiState().info?.pending_submissions ?? []).some(
+    row => row.admission_id === admissionId && (row as { steering?: boolean }).steering === true
+  )
+}
+
+/** Reads the admission's receipt (never sends): the table's input for every non-success answer. */
+async function readSteerReceipt(item: QueueItem, ctx: AdmissionContext): Promise<SteerOutcome> {
+  if (!item.admissionId) {
+    return 'indeterminate'
+  }
+
+  const steering = steerSteeringMarked(item.admissionId)
+
+  try {
+    const receipt = await ctx.deps.gw.request<PromptSubmitResponse>('prompt.receipt', {
+      admission_id: item.admissionId,
+      session_id: ctx.sid
+    })
+
+    return steerOutcome(receipt, steering)
+  } catch (error) {
+    const reason = refusalReason(error)
+
+    return reason === 'not_found' || reason === 'permission_denied' ? 'refused' : 'indeterminate'
+  }
+}
+
+/** Applies the table's settlement: the row keeps its text and place unless it was delivered. */
+function applySteerOutcome(item: QueueItem, outcome: SteerOutcome, ctx: AdmissionContext): void {
+  const { deps, focused } = ctx
+
+  if (outcome === 'delivered') {
+    item.steering = false
+    item.settlement = undefined
+    item.settle?.(true)
+
+    if (focused()) {
+      deps.sys(t('canonical.submit.steerDelivered'))
+    }
+
+    return
+  }
+
+  if (outcome === 'in-transfer') {
+    item.steering = true
+    savePendingInput(item)
+
+    if (focused()) {
+      deps.sys(t('canonical.submit.steerInTransfer'))
+    }
+
+    return
+  }
+
+  item.steering = false
+  item.settlement = outcome
+
+  if (item.settle) {
+    item.settle(false)
+  } else {
+    item.inFlight = false
+    item.failed = true
+    savePendingInput(item)
+  }
+
+  if (focused()) {
+    deps.sys(t(outcome === 'refused' ? 'canonical.submit.correctionRejected' : 'canonical.submit.steerUnconfirmed'))
+  }
+}
+
+async function steerAdmission(
+  item: QueueItem,
+  r: PromptSubmitResponse | null | undefined,
+  ctx: AdmissionContext
+): Promise<void> {
+  const { deps, destination } = ctx
+
+  const admitted =
+    (r?.input_id ?? r?.admission_id) === item.submissionId &&
+    Boolean(destination.storedSid) &&
+    r?.target_session_id === destination.storedSid &&
+    r?.target_profile_home === (destination.ownerHome ?? destination.profileHome) &&
+    typeof r?.admission_id === 'string'
+
+  if (!admitted) {
+    applySteerOutcome(item, 'indeterminate', ctx)
+
+    return
+  }
+
+  // The identity carrier, written before the transfer: a cold load or a lost reply reads the
+  // admission back by this id instead of replaying the text.
+  item.admissionId = r!.admission_id
+  item.controlMethod = STEER_QUEUED_CONTROL
+  savePendingInput(item)
+
+  try {
+    const reply = await deps.gw.request<PromptSubmitResponse>('prompt.steer_queued', {
+      admission_id: item.admissionId,
+      session_id: ctx.sid
+    })
+
+    applySteerOutcome(item, steerOutcome(reply, true), ctx)
+  } catch (error) {
+    const reason = refusalReason(error)
+
+    if (STEER_BOUNDARY_REFUSALS.has(reason ?? '')) {
+      applySteerOutcome(item, 'delivered', ctx)
+
+      return
+    }
+
+    if (reason === 'unsupported_control') {
+      applySteerOutcome(item, 'refused', ctx)
+
+      return
+    }
+
+    // admission_started, not_found, permission_denied or a transport loss: the receipt is the truth.
+    applySteerOutcome(item, await readSteerReceipt(item, ctx), ctx)
+  }
+}
+
+/** The submit itself got no reply: adopt the admission by input_id when it exists, else keep it. */
+function steerSubmitFailure(item: QueueItem, error: Error & { code?: number }, ctx: AdmissionContext): void {
+  if (refusalReason(error)) {
+    applySteerOutcome(item, 'refused', ctx)
+
+    return
+  }
+
+  const row = (getUiState().info?.pending_submissions ?? []).find(row => row.input_id === item.submissionId)
+
+  if (!row?.admission_id) {
+    applySteerOutcome(item, 'indeterminate', ctx)
+
+    return
+  }
+
+  item.admissionId = row.admission_id
+  item.controlMethod = STEER_QUEUED_CONTROL
+  savePendingInput(item)
+  void readSteerReceipt(item, ctx).then(outcome => applySteerOutcome(item, outcome, ctx))
 }
 
 function refreshExecutionStatus({ deps, focused, owner, sid }: AdmissionContext): void {
@@ -381,7 +566,9 @@ export function submitPrompt(
       prepareQueueItem(item, submitText, opts, ownsTurn, show)
     }
 
-    if (item?.controlMethod && item.attachments?.length) {
+    const steer = Boolean(opts.steer && item)
+
+    if ((item?.controlMethod || steer) && item?.attachments?.length) {
       item.settle?.(false)
 
       if (focused()) {
@@ -398,6 +585,10 @@ export function submitPrompt(
         submitParams(sid, item, submitText, opts.attachments, voiceTranscript === submitText.trim())
       )
       .then(r => {
+        if (steer) {
+          return steerAdmission(item!, r, { deps, destination, focused, owner, sid })
+        }
+
         if (item?.controlMethod) {
           if (!settleControlReply(item, r, deps, focused, sid)) {
             readmit(item)
@@ -436,6 +627,12 @@ export function submitPrompt(
         }
       })
       .catch(async (e: Error & { code?: number }) => {
+        if (steer) {
+          steerSubmitFailure(item!, e, { deps, destination, focused, owner, sid })
+
+          return
+        }
+
         // 4094 is a pre-admission refusal, not an ambiguous write; so is 4000 when the
         // legacy `hermes serve` contract refuses `submission_id` as an unknown key. Special
         // compute modes still support legacy submit; retry only these refusals,

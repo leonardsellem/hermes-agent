@@ -30,6 +30,9 @@ export const canonicalEn = {
       statusDeliveryUnconfirmed: 'delivery unconfirmed',
       deliveryNotResent: 'delivery unconfirmed — check the session before sending a new input; retained input was not resent',
       busyTextOnly: 'busy corrections accept text only — image input retained; submit it with /queue',
+      steerInTransfer: 'correction in transfer — it settles with the running turn',
+      steerDelivered: 'correction delivered',
+      steerUnconfirmed: 'correction unconfirmed — text kept; Ctrl+K re-sends it as a new message',
       inputRetained: (message: string) => `input retained: ${message} — Alt+K retries the same submission`,
       imageNotSubmitted: (message: string) => `image not submitted: ${message} — input retained`,
       statusImageNotSubmitted: 'image not submitted',
@@ -44,6 +47,10 @@ export const canonicalEn = {
       // {0}=input text of a turn lost when the gateway restarted (status unknown): it pauses the queue
       // until the person drops it (select it with ↑, then Ctrl+X → prompt.resolve_unknown).
       lostRow: (text: string) => `[paused: lost in restart · ↑ select, Ctrl+X discard] ${text}`,
+      // An admission in transfer to the running turn: it may still return to its queue place, so it
+      // is neither queued nor delivered yet (LS-3826 U3).
+      steeringRow: (text: string) => `[steering into the running turn] ${text}`,
+      retriedAsNew: 're-sent as a new message',
       discardFailed: (message: string) => `discard failed: ${message}`,
       journalCleanupFailed: (message: string) => `input delivered; journal cleanup failed: ${message}`,
       notSavedQueueKept: (message: string) => `input not saved: ${message} — queue kept`,
