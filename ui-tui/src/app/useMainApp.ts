@@ -64,7 +64,7 @@ import { applyProcessSnapshot, type ProcessEntry } from './processRoster.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { respondToServerRequest } from './serverRequestStore.js'
 import { mutateCanonicalSession } from './slash/canonicalSessionControls.js'
-import { setSlashCatalog, useSlashCatalog } from './slashCatalog.js'
+import { useSlashCatalog } from './slashCatalog.js'
 import { captureDestination, isCurrentDestination, type SubmissionDestination } from './submissionDestination.js'
 import { turnController } from './turnController.js'
 import { patchTurnState, useTurnSelector } from './turnStore.js'
@@ -661,7 +661,7 @@ export function useMainApp(gw: GatewayClient) {
 
   const gateway = useMemo(() => ({ gw, rpc }), [gw, rpc])
   const catalogRequest = useMemo(() => gw.request.bind(gw), [gw])
-  const catalog = useSlashCatalog(catalogRequest)
+  const { catalog, setCatalog } = useSlashCatalog(catalogRequest)
 
   const { die, dieWithCode, exitClose } = useDie(gw, exit)
 
@@ -1043,7 +1043,7 @@ export function useMainApp(gw: GatewayClient) {
           recoverSidRef,
           resetSession: session.resetSession,
           resumeById: session.resumeById,
-          setCatalog: setSlashCatalog
+          setCatalog
         },
         submission: { submitLiteralRef, submitRef },
         system: { bellOnComplete, bellOnPrompt, stdout, sys },
@@ -1066,6 +1066,7 @@ export function useMainApp(gw: GatewayClient) {
       session.newSession,
       session.resetSession,
       session.resumeById,
+      setCatalog,
       setHistoryItems,
       setVoiceEnabled,
       setVoiceProcessing,
@@ -1210,7 +1211,7 @@ export function useMainApp(gw: GatewayClient) {
           getHistoryItems: () => historyItemsRef.current,
           getLastUserMsg: () => lastUserMsgRef.current,
           maybeWarn,
-          setCatalog: setSlashCatalog
+          setCatalog
         },
         session: {
           closeSession: session.closeSession,
@@ -1241,6 +1242,7 @@ export function useMainApp(gw: GatewayClient) {
       selection,
       send,
       session,
+      setCatalog,
       setHistoryItems,
       sys
     ]
