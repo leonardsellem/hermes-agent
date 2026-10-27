@@ -18,6 +18,7 @@ from hermes_state_runtime import (
     STEERING, RuntimeStoreError, check_replaced_input, find_session_admission, get_session_admission,
     replacement_binding, retire_replaced_input, revert_steer_input, steer_replayed, steer_session_input,
 )
+from hermes_state_common import _source_match_clause
 
 # A steer carries plain text and its presentation only. Attachments, finite runs, classic-CLI turns,
 # native envelopes and automation rows are whole turns: neither verb may drop what they carry.
@@ -36,17 +37,20 @@ def handlers(connection):
 
 
 def _interactive(authority, session_id):
-    """The session's frozen launch source (a local session's row records it) names a local surface.
+    """The session's frozen launch surface names a local one: ``source`` itself, or the real surface
+    a shared-gateway row keeps in ``created_source`` over ``source='local'`` (a TUI row is
+    ``local`` + ``tui``).
     Callers hold the stream lock: one plain read per session, cached (``get_session`` flushes token
     counts, a write). Under WAL it takes the lock-free reader pool, as ``_pending_rows`` does there."""
     sources = authority.launch_sources
     if session_id not in sources:
+        clause, params = _source_match_clause(_INTERACTIVE_SOURCES, _INTERACTIVE_SOURCES)
         with authority.db._read_ctx() as conn:
-            found = conn.execute('SELECT source FROM sessions WHERE id=?', (session_id,)).fetchone()
-        if found is None:
-            return False
-        sources[session_id] = found[0]
-    return sources[session_id] in _INTERACTIVE_SOURCES
+            found = conn.execute(f'SELECT 1 FROM sessions s WHERE s.id=? AND {clause}',
+                                 (session_id, *params)).fetchone()
+        sources[session_id] = found is not None
+    verdict = sources[session_id]
+    return verdict is True or verdict in _INTERACTIVE_SOURCES
 
 
 def queued_controls(authority, row):
