@@ -261,8 +261,9 @@ export function steerOutcome(
 const refusalReason = (error: unknown) =>
   (error as { data?: { reason?: unknown } } | null)?.data?.reason as string | undefined
 
-// Both refusals leave the row `queued`: the admission is the delivery, and it runs at the boundary.
-const STEER_BOUNDARY_REFUSALS = new Set(['session_idle', 'steer_unavailable'])
+// Refused before any row touch, so the row is still `queued`: the admission is the delivery and runs
+// at the turn boundary (spec-LS-3826.md settlement row 2).
+const STEER_BOUNDARY_REFUSALS = new Set(['session_idle', 'steer_unavailable', 'unsupported_control'])
 
 function steerSteeringMarked(admissionId: string): boolean {
   return (getUiState().info?.pending_submissions ?? []).some(
@@ -389,11 +390,6 @@ async function steerAdmission(
       return
     }
 
-    if (reason === 'unsupported_control') {
-      applySteerOutcome(item, 'refused', ctx)
-
-      return
-    }
 
     // admission_started, not_found, permission_denied or a transport loss: the receipt is the truth.
     applySteerOutcome(item, await readSteerReceipt(item, ctx), ctx)

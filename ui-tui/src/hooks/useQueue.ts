@@ -25,6 +25,9 @@ type PendingRow = NonNullable<SessionInfo['pending_submissions']>[number]
 // but it is not the client's to drain either (LS-3826 U3).
 const steeringRow = (row: PendingRow) => row.status === 'started' && (row as { steering?: boolean }).steering === true
 const listedRow = (row: PendingRow) => isServerQueued(row) || steeringRow(row)
+// The one index space `queuedDisplay`, `serverRowAt` and `queueDraft` address: local rows in transfer
+// are shown by their server row, so they take no index.
+const visibleLocals = (items: QueueItem[]) => items.filter(item => !item.steering)
 
 export interface QueueItem {
   display: string
@@ -237,9 +240,9 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
 
   const queuedDisplay = [
     // A record in transfer is shown by its server row, in the transfer's own wording.
-    ...queueRef.current
-      .filter(item => !item.steering)
-      .map(item => `${item.failed ? t('canonical.queue.unconfirmedPrefix') : ''}${item.display}`),
+    ...visibleLocals(queueRef.current).map(
+      item => `${item.failed ? t('canonical.queue.unconfirmedPrefix') : ''}${item.display}`
+    ),
     // A queued row reads as main's plain queue line; only an unknown execution or a transfer keeps a tag.
     ...serverRows.map(row =>
       steeringRow(row)
@@ -256,7 +259,7 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
   // render state: key handlers run between renders).
   const serverRowAt = useCallback(
     (index: number) => {
-      const local = queueRef.current.length
+      const local = visibleLocals(queueRef.current).length
 
       return index >= local ? (getUiState().info?.pending_submissions ?? []).filter(listedRow)[index - local] : undefined
     },
@@ -264,7 +267,7 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
   )
 
   const queueDraft = useCallback(
-    (index: number) => serverRowAt(index)?.user ?? queueRef.current[index]?.display ?? '',
+    (index: number) => serverRowAt(index)?.user ?? visibleLocals(queueRef.current)[index]?.display ?? '',
     [queueRef, serverRowAt]
   )
 
