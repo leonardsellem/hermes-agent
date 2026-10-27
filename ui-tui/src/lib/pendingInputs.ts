@@ -13,6 +13,8 @@ import {
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+import { atom } from 'nanostores'
+
 import type { SubmissionDestination } from '../app/submissionDestination.js'
 import type { QueueItem } from '../hooks/useQueue.js'
 import { t } from '../i18n/runtime.js'
@@ -23,6 +25,11 @@ const directory = (home?: string) =>
 const recordName = /^[0-9a-f-]{36}\.json$/
 const successors = new Map<string, SubmissionDestination>()
 export let pendingInputRevision = 0
+
+// Bumped on `gateway.ready`: a record whose steer reply never arrived is settled from its receipt
+// when the socket comes back, not only when the next session snapshot happens to change.
+export const $steerReconcile = atom(0)
+export const bumpSteerReconcile = () => $steerReconcile.set($steerReconcile.get() + 1)
 
 export const pendingDestinationKey = (destination: SubmissionDestination) =>
   JSON.stringify([destination.profileHome, destination.profile, destination.sid])

@@ -4,11 +4,12 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { isServerQueued } from '../app/pendingBubbles.js'
-import { STEER_QUEUED_CONTROL } from '../app/submissionCore.js'
+import { readSteerOutcome, STEER_QUEUED_CONTROL } from '../app/submissionCore.js'
 import { captureDestination, type SubmissionDestination } from '../app/submissionDestination.js'
 import { $uiState, getUiState, patchUiState } from '../app/uiStore.js'
 import { t } from '../i18n/runtime.js'
 import {
+  $steerReconcile,
   loadPendingInputs,
   pendingDestinationKey,
   pendingInputOwner,
@@ -414,6 +415,114 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
       }
     }
   }, [ui.info, getQueue, syncQueue])
+
+  // A record whose admission was named is settled from its receipt after a reconnect or a cold load,
+  // one read per record per snapshot (LS-3826 U2b). While the snapshot marks it steering it is in
+  // transfer and stays untouched: the receipt is read when it leaves the pending list.
+  const reconcileTick = useStore($steerReconcile)
+  const reconciled = useRef(new Map<string, { info: unknown; tick: number }>())
+
+  useEffect(() => {
+    if (!gw) {
+      return
+    }
+
+    const queue = getQueue()
+    const info = getUiState().info
+    const sid = queue.destination?.sid
+
+    if (!sid) {
+      return
+    }
+
+    const pending = info?.pending_submissions ?? []
+
+    for (const item of [...queue.items]) {
+      if (item.controlMethod !== STEER_QUEUED_CONTROL) {
+        continue
+      }
+
+      const key = item.submissionId ?? item.admissionId ?? ''
+      const stamp = reconciled.current.get(key)
+
+      if (stamp && stamp.info === info && stamp.tick === reconcileTick) {
+        continue
+      }
+
+      reconciled.current.set(key, { info, tick: reconcileTick })
+
+      const row = pending.find(candidate =>
+        item.admissionId ? candidate.admission_id === item.admissionId : candidate.input_id === item.submissionId
+      )
+
+      if (row && steeringRow(row)) {
+        if (!item.steering) {
+          item.steering = true
+          savePendingInput(item)
+          syncQueue()
+        }
+
+        continue
+      }
+
+      if (!item.admissionId) {
+        // No submit receipt ever named an admission and the row is not pending: it cannot have been
+        // steered, because steer_queued needs the id. Keep the text, never replay it.
+        if (!row?.admission_id) {
+          retain(item, 'indeterminate')
+
+          continue
+        }
+
+        item.admissionId = row.admission_id
+        savePendingInput(item)
+      }
+
+      void readSteerOutcome(gw, sid, item.admissionId, false).then(outcome => {
+        if (outcome === 'in-transfer') {
+          item.steering = true
+          savePendingInput(item)
+
+          return syncQueue()
+        }
+
+        if (outcome === 'delivered') {
+          item.steering = false
+          item.settlement = undefined
+
+          if (item.settle) {
+            return item.settle(true)
+          }
+
+          removePendingInput(item)
+
+          for (const pendingQueue of queues.current.values()) {
+            removeAtInPlace(pendingQueue.items, pendingQueue.items.indexOf(item))
+          }
+
+          syncQueue()
+
+          return
+        }
+
+        retain(item, outcome)
+      })
+    }
+
+    function retain(item: QueueItem, outcome: 'indeterminate' | 'refused'): void {
+      item.steering = false
+      item.settlement = outcome
+      item.inFlight = false
+      item.failed = true
+
+      if (item.settle) {
+        return item.settle(false)
+      }
+
+      savePendingInput(item)
+      syncQueue()
+    }
+  }, [ui.info, reconcileTick, gw, getQueue, syncQueue])
 
   // One durable write: the row joins the queue only once its attempt is journaled,
   // so a failed write leaves the composer as the draft's only copy.
