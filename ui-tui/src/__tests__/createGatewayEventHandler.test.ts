@@ -128,7 +128,7 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.gateway.gw.request).toHaveBeenCalledWith('commands.catalog', {})
     expect(ctx.gateway.rpc.mock.calls.some(([method]: [string]) => method === 'commands.catalog')).toBe(false)
     expect(ctx.system.sys).not.toHaveBeenCalledWith(expect.stringContaining('did not answer'))
-    expect(getTurnState().activity[0]?.text).toContain('command catalog unavailable: Hermes did not answer within 120s')
+    expect(getTurnState().activity[0]?.text).toContain('command catalog unavailable: Hermes did not answer commands.catalog within 120s')
   })
 
   it('skills.changed catalog load uses the rejecting request', async () => {
@@ -144,7 +144,7 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.gateway.gw.request).toHaveBeenCalledWith('commands.catalog', { session_id: 'owner' })
     expect(ctx.gateway.rpc.mock.calls.some(([method]: [string]) => method === 'commands.catalog')).toBe(false)
     expect(ctx.system.sys).not.toHaveBeenCalledWith(expect.stringContaining('did not answer'))
-    expect(getTurnState().activity[0]?.text).toContain('command catalog unavailable: Hermes did not answer within 120s')
+    expect(getTurnState().activity[0]?.text).toContain('command catalog unavailable: Hermes did not answer commands.catalog within 120s')
   })
 
   it('an idle snapshot a frame ahead of the final leaves the tool trail for the final to archive', () => {

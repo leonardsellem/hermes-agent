@@ -104,7 +104,7 @@ describe('loadSlashCatalog', () => {
       expect(catalog).toBe(previous)
       expect(getTurnState().activity).toHaveLength(1)
       expect(getTurnState().activity[0]).toMatchObject({
-        text: expect.stringContaining('command catalog unavailable: Hermes did not answer within 120s'), tone: 'info'
+        text: expect.stringContaining('command catalog unavailable: Hermes did not answer commands.catalog within 120s'), tone: 'info'
       })
       expect(sink).toHaveBeenCalledExactlyOnceWith('[rpc] request timed out after 120s: commands.catalog')
     } finally {
