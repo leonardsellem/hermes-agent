@@ -36,7 +36,9 @@ def handlers(connection):
 
 
 def _interactive(authority, session_id):
-    """The session's frozen launch source (a local session's row records it) names a local surface.
+    """The session's frozen launch surface names a local one: ``source`` itself, or the real surface
+    a shared-gateway row keeps in ``created_source`` over ``source='local'`` (a TUI row is
+    ``local`` + ``tui``).
     Callers hold the stream lock: one plain read per session, cached (``get_session`` flushes token
     counts, a write). Under WAL it takes the lock-free reader pool, as ``_pending_rows`` does there."""
     sources = authority.launch_sources
@@ -44,8 +46,12 @@ def _interactive(authority, session_id):
         found = authority_persistence(authority).sessions.list_row(session_id)
         if found is None:
             return False
-        sources[session_id] = found.source
-    return sources[session_id] in _INTERACTIVE_SOURCES
+        sources[session_id] = (
+            found.source in _INTERACTIVE_SOURCES
+            or (found.source == 'local' and found.created_source in _INTERACTIVE_SOURCES)
+        )
+    verdict = sources[session_id]
+    return verdict is True or verdict in _INTERACTIVE_SOURCES
 
 
 def queued_controls(authority, row):
