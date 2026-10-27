@@ -35,17 +35,18 @@ function harness() {
   })
 
   const sys = vi.fn()
+  const send = vi.fn()
 
   const ctx = {
     slashFlightRef: { current: 0 },
     gateway: { gw: { isCanonical: true, request }, rpc: request },
-    transcript: { sys, setHistoryItems: vi.fn() },
+    transcript: { send, sys, setHistoryItems: vi.fn() },
     local: { maybeWarn: vi.fn() },
     session: { resumeById: vi.fn() },
     composer: { enqueue: vi.fn() }
   }
 
-  return { ctx, request, slash: createSlashHandler(ctx as any) }
+  return { ctx, request, send, slash: createSlashHandler(ctx as any) }
 }
 
 beforeEach(() => {
@@ -132,9 +133,9 @@ it('late model or compression replies cannot replace a newer execution snapshot'
   }
 })
 
-it('busy mode is session scoped and steering includes the observed execution generation', async () => {
+it('busy mode is session scoped and canonical steering goes through the admission', async () => {
   patchUiState({ busy: true })
-  const { request, slash } = harness()
+  const { request, send, slash } = harness()
   slash('/busy steer')
   await flush()
   expect(request).toHaveBeenCalledWith('config.set', { key: 'busy', value: 'steer', session_id: 'owner' })
@@ -144,11 +145,9 @@ it('busy mode is session scoped and steering includes the observed execution gen
   expect(request).toHaveBeenCalledWith('config.get', { key: 'busy', session_id: 'owner' })
   slash('/steer correction')
   await flush()
-  expect(request).toHaveBeenCalledWith('session.steer', {
-    session_id: 'owner',
-    text: 'correction',
-    execution_generation: 4
-  })
+  // A busy correction is admitted first: it has no receipt-less session.steer any more.
+  expect(request).not.toHaveBeenCalledWith('session.steer', expect.anything())
+  expect(send).toHaveBeenCalledWith('correction', true, 'correction', expect.any(Function), expect.objectContaining({ steer: true }))
 })
 
 it('a guarded canonical model switch asks; yes re-sends once with the owner token, no changes nothing', async () => {

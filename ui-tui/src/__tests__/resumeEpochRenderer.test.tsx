@@ -102,7 +102,8 @@ it('resumes a successor with a reset epoch while retaining original attempted ad
     expect(queue.queueRef.current[0]?.destination?.storedSid).toBe('stored-old')
     expect(queue.queueRef.current[1]?.destination?.storedSid).toBe('stored-successor')
     expect(getUiState().info?.stored_session_id).toBe('stored-successor')
-    expect(queue.dequeue()).toBeUndefined()
+    // The old target's retained row keeps its place without holding the successor's row behind it.
+    expect(queue.dequeue()?.text).toBe('not attempted')
   } finally {
     instance.unmount()
     resetUiState()

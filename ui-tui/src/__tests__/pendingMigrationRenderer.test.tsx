@@ -60,12 +60,15 @@ it('moves compression queues across cached successors without changing attempted
     // Late completion must find the migrated queue even before a getter/render.
     settle!(false)
     expect(queue.queueRef.current[0]).toBe(attempted)
-    expect(queue.dequeue()).toBeUndefined()
+    // The retained head keeps its place without holding the row behind it (LS-3827 R3).
+    expect(queue.dequeue()?.text).toBe('waiting')
     instance.unmount()
     instance = renderSync(<Harness />, options)
     const restored = queue.queueRef.current[0]
     expect(restored).toMatchObject({ destination: original, failed: true, submissionId: attempted.submissionId })
-    expect(queue.dequeue()).toBeUndefined()
+    // A fresh render keeps the same order: the retained head first, then the rows it cannot hold.
+    expect(queue.queueRef.current[0]?.failed).toBe(true)
+    expect(queue.dequeue()?.text).toBe('already next')
     queue.dequeue(true)!.settle!(true)
     expect(queue.queueRef.current.map(item => item.text)).toEqual(['waiting', 'already next'])
     expect(pending.loadPendingInputs(captureDestination())).toHaveLength(2)
