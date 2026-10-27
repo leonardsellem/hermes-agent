@@ -5,7 +5,7 @@ import type { InputDetectDropResponse, PromptSubmitResponse, SessionActivateResp
 import type { QueueItem } from '../hooks/useQueue.js'
 import { t } from '../i18n/runtime.js'
 import { stageImagePath } from '../lib/imageAttachments.js'
-import { pendingInputOwner, savePendingInput } from '../lib/pendingInputs.js'
+import { pendingInputOwner, removePendingInput, savePendingInput } from '../lib/pendingInputs.js'
 import type { Msg } from '../types.js'
 
 import { markBubbleShown } from './pendingBubbles.js'
@@ -270,19 +270,18 @@ function steerSteeringMarked(admissionId: string): boolean {
   )
 }
 
-/** Reads the admission's receipt (never sends): the table's input for every non-success answer. */
-async function readSteerReceipt(item: QueueItem, ctx: AdmissionContext): Promise<SteerOutcome> {
-  if (!item.admissionId) {
-    return 'indeterminate'
-  }
-
-  const steering = steerSteeringMarked(item.admissionId)
-
+/** Reads one admission's receipt (never sends): the table's input for every non-success answer. */
+export async function readSteerOutcome(
+  gw: { request: (method: string, params: Record<string, unknown>) => Promise<unknown> },
+  sessionId: string,
+  admissionId: string,
+  steering: boolean
+): Promise<SteerOutcome> {
   try {
-    const receipt = await ctx.deps.gw.request<PromptSubmitResponse>('prompt.receipt', {
-      admission_id: item.admissionId,
-      session_id: ctx.sid
-    })
+    const receipt = (await gw.request('prompt.receipt', {
+      admission_id: admissionId,
+      session_id: sessionId
+    })) as PromptSubmitResponse | null
 
     return steerOutcome(receipt, steering)
   } catch (error) {
@@ -292,6 +291,14 @@ async function readSteerReceipt(item: QueueItem, ctx: AdmissionContext): Promise
   }
 }
 
+async function readSteerReceipt(item: QueueItem, ctx: AdmissionContext): Promise<SteerOutcome> {
+  if (!item.admissionId) {
+    return 'indeterminate'
+  }
+
+  return readSteerOutcome(ctx.deps.gw, ctx.sid, item.admissionId, steerSteeringMarked(item.admissionId))
+}
+
 /** Applies the table's settlement: the row keeps its text and place unless it was delivered. */
 function applySteerOutcome(item: QueueItem, outcome: SteerOutcome, ctx: AdmissionContext): void {
   const { deps, focused } = ctx
@@ -299,7 +306,12 @@ function applySteerOutcome(item: QueueItem, outcome: SteerOutcome, ctx: Admissio
   if (outcome === 'delivered') {
     item.steering = false
     item.settlement = undefined
-    item.settle?.(true)
+
+    if (item.settle) {
+      item.settle(true)
+    } else {
+      removePendingInput(item)
+    }
 
     if (focused()) {
       deps.sys(t('canonical.submit.steerDelivered'))
