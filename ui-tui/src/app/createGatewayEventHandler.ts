@@ -810,6 +810,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   syncThemeToTerminalBackground()
 
   const { gw, rpc } = ctx.gateway
+  const catalogRequest = gw.request.bind(gw)
   const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
   const { bellOnComplete, bellOnPrompt, stdout, sys } = ctx.system
 
@@ -1085,7 +1086,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     // The pre-session catalog; useSlashCatalog owns every session-bound load, reconnects included.
     if (!getUiState().sid) {
-      void loadSlashCatalog(rpc, null, setCatalog)
+      void loadSlashCatalog(catalogRequest, null, setCatalog)
     }
 
     // Keep the recovery target until resume succeeds, including across a second
@@ -1178,7 +1179,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
   // Shared-control settles and the skills.changed catalog refetch need no per-event state.
   const handledBeforeSwitch = (ev: AnyGatewayEvent) =>
-    settleSharedPrompt(ev) || refreshSlashCatalogOnSkillsChange(ev, rpc, setCatalog)
+    settleSharedPrompt(ev) || refreshSlashCatalogOnSkillsChange(ev, catalogRequest, setCatalog)
 
   return (ev: AnyGatewayEvent) => {
     const sid = getUiState().sid
