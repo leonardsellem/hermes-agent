@@ -85,7 +85,14 @@ export function takeQueueItem(queue: QueueItem[], index: number, editedDisplay?:
     ...kept
   } = item
 
-  return { ...kept, display: editedDisplay, text }
+  const edited: QueueItem = { ...kept, display: editedDisplay, text }
+
+  // A dead attempt's control intent names a generation that no longer exists: the edit is a new
+  // message, never a replay of the request that was already refused (LS-3827 U2).
+  return item.failed
+    ? { ...edited, admissionId: undefined, controlMethod: undefined, executionGeneration: undefined,
+        settlement: undefined, steering: undefined }
+    : edited
 }
 
 // Mutates `arr` in place; returned reference is the same input array, kept
@@ -543,10 +550,49 @@ export function useQueue(gw?: { request: (method: string, params: Record<string,
     (retry = false) => {
       if (getUiState().gatewayConnected === false) { return undefined }
       const queue = getQueue()
-      const item = queue.items[0]
+      const items = queue.items
+      const head = items[0]
 
-      if (!item || item.inFlight || (item.failed && !retry)) {
-        return undefined
+      // A live send owns the head; a record in transfer does not — it is no longer sendable here.
+      if (head?.inFlight && !head.steering) { return undefined }
+
+      // FIFO among sendable items: a retained record keeps its place but never holds the ones behind
+      // it (LS-3827 R3). A retry may pick the first item at all, dead or not.
+      const index = items.findIndex(item => !item.inFlight && (retry || !item.failed))
+
+      if (index < 0) { return undefined }
+
+      const item = items[index]!
+
+      // A dead control attempt has no identity that can succeed: re-admit its words as a new message
+      // instead of re-hitting the guard that refused the old request (LS-3827 R4).
+      if (retry && (item.legacyAttempted || item.settlement || item.admissionId || item.controlMethod)) {
+        removePendingInput(item)
+
+        const fresh: QueueItem = {
+          ...item,
+          admissionId: undefined,
+          controlMethod: undefined,
+          executionGeneration: undefined,
+          failed: false,
+          inFlight: false,
+          legacyAttempted: undefined,
+          settlement: undefined,
+          settle: undefined,
+          steering: undefined,
+          submissionId: undefined
+        }
+
+        items.splice(index, 1, fresh)
+        patchUiState({ status: t('canonical.queue.retriedAsNew') })
+
+        try {
+          return claim(queue, fresh)
+        } catch (error) {
+          patchUiState({ status: t('canonical.queue.notSavedQueueKept', (error as Error).message) })
+
+          return undefined
+        }
       }
 
       try {

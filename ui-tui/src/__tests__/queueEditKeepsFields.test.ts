@@ -6,7 +6,7 @@ const destination = { sid: 'chat-a', storedSid: 'chat-a' } as any
 const attachments = [{ mime: 'image/png', path: '/w/shot.png' }]
 
 describe('editing the text of a local queued item', () => {
-  it('keeps its attachments, destination and control intent, and starts a new submission', () => {
+  it('edited-live-row-keeps-control-intent', () => {
     const queue = [
       {
         attachments,
@@ -14,7 +14,6 @@ describe('editing the text of a local queued item', () => {
         destination,
         display: 'look at this',
         executionGeneration: 4,
-        failed: true,
         ownerDestination: destination,
         preparedText: 'look at this [image]',
         submissionId: 'sub-1',
@@ -33,5 +32,30 @@ describe('editing the text of a local queued item', () => {
       ownerDestination: destination,
       text: 'look at this closely'
     })
+  })
+
+  // A failed row's control intent names a generation that is over, so an edit that kept it would be
+  // refused again for a generation that no longer exists (LS-3827 U2).
+  it('edited-failed-row-clears-dead-generation', () => {
+    const queue = [
+      {
+        controlMethod: 'session.steer' as const,
+        destination,
+        display: 'look at this',
+        executionGeneration: 4,
+        failed: true,
+        legacyAttempted: true,
+        ownerDestination: destination,
+        submissionId: 'sub-1',
+        text: 'look at this'
+      }
+    ]
+
+    const edited = takeQueueItem(queue, 0, 'look at this closely')
+
+    expect(edited?.text).toBe('look at this closely')
+    expect(edited?.controlMethod).toBeUndefined()
+    expect(edited?.executionGeneration).toBeUndefined()
+    expect(edited?.legacyAttempted).toBeUndefined()
   })
 })
