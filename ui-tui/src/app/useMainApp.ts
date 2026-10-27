@@ -14,7 +14,6 @@ import type {
   AnyGatewayEvent,
   ClarifyLockResponse,
   ConfigSetResponse,
-  SessionActiveListResponse,
   SessionCloseResponse,
   SharedControlRespondResponse,
   SubagentListResponse,
@@ -60,9 +59,10 @@ import { applyLiveSessionRoster, requestLiveSessions } from './liveSessions.js'
 import { applyControlSnapshot } from './loopStatus.js'
 import { $overlayState, capturePromptResponseGuard, hasSensitivePrompt, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
-import { applyProcessSnapshot, type ProcessEntry } from './processRoster.js'
+import { applyProcessSnapshot } from './processRoster.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { respondToServerRequest } from './serverRequestStore.js'
+import { createSessionPolls } from './sessionPolls.js'
 import { mutateCanonicalSession } from './slash/canonicalSessionControls.js'
 import { useSlashCatalog } from './slashCatalog.js'
 import { captureDestination, isCurrentDestination, type SubmissionDestination } from './submissionDestination.js'
@@ -732,44 +732,22 @@ export function useMainApp(gw: GatewayClient) {
       })
       .catch(() => {})
 
-    const refresh = () => {
-      const sid = ui.sid
-      gw.request<SubagentListResponse>('subagent.list', { session_id: sid })
-        .then(raw => {
-          const result = asRpcResult<SubagentListResponse>(raw)
-
-          if (!stopped && result && getUiState().sid === sid) {
-            applyAgentSnapshot(sid, result)
-          }
-        })
-        .catch(() => {})
+    const polls = createSessionPolls(gw, () => getUiState().sid, {
+      applyAgent: (sid, result) => applyAgentSnapshot(sid, result),
+      applyLiveSessions: sessions => {
+        noteLiveSessions(gw, sessions, sys, () => !stopped)
+        applyLiveSessionRoster(sessions)
+      },
       // Background processes share the dock with the subagents (Processes block).
-      gw.request<{ processes: ProcessEntry[] }>('process.list', { session_id: sid })
-        .then(raw => {
-          const result = asRpcResult<{ processes: ProcessEntry[] }>(raw)
+      applyProcess: (sid, processes) => applyProcessSnapshot(sid, processes)
+    })
 
-          if (!stopped && result && getUiState().sid === sid) {
-            applyProcessSnapshot(sid, result.processes ?? [])
-          }
-        })
-        .catch(() => {})
-      requestLiveSessions(gw, getUiState().sid)
-        .then(raw => {
-          const result = asRpcResult<SessionActiveListResponse>(raw)
-
-          if (!stopped && result?.sessions) {
-            noteLiveSessions(gw, result.sessions, sys, () => !stopped)
-            applyLiveSessionRoster(result.sessions)
-          }
-        })
-        .catch(() => {})
-    }
-
-    refresh()
-    const timer = setInterval(refresh, 1500)
+    polls.refresh()
+    const timer = setInterval(polls.refresh, 1500)
 
     return () => {
       stopped = true
+      polls.stop()
       clearInterval(timer)
     }
   }, [gw, sys, ui.sid, ui.gatewayConnected])
