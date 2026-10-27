@@ -1,8 +1,10 @@
 import { looksLikeSlashCommand } from '@hermes/shared/slash'
-import { useEffect, useRef, useState } from 'react'
+import { useStore } from '@nanostores/react'
+import { useEffect, useMemo, useState } from 'react'
 
 import type { CompletionItem } from '../app/interfaces.js'
 import { rankSlashItems } from '../app/slash/fuzzyScore.js'
+import { $slashCatalog, $slashCatalogOwner } from '../app/slashCatalog.js'
 import { getUiState, sessionCwd } from '../app/uiStore.js'
 import { inlineSlashTrigger } from '../domain/slash.js'
 import type { GatewayClient } from '../gatewayClient.js'
@@ -84,41 +86,45 @@ export function completionRequestForInput(
 }
 
 export function useCompletion(input: string, blocked: boolean, gw: GatewayClient) {
-  const [completions, setCompletions] = useState<CompletionItem[]>([])
+  const catalog = useStore($slashCatalog)
+  const owner = useStore($slashCatalogOwner)
+
+  const [reply, setReply] = useState<{
+    input: string; owner: number; items: CompletionItem[]; replaceFrom: number; failed?: boolean
+  } | null>(null)
+
   const [compIdx, setCompIdx] = useState(0)
-  const [compReplace, setCompReplace] = useState(0)
-  const ref = useRef('')
+
+  const cached = useMemo(() => {
+    const request = completionRequestForInput(input)
+
+    if (!catalog || request?.method !== 'complete.slash' || request.skillsOnly || request.params.text.includes(' ')) {
+      return []
+    }
+
+    return mergeWidgetAppItems(input, rankSlashItems(catalog.pairs, input, ([name, description]) => ({
+      id: name.replace(/^\//, ''), description
+    })).map(([name, description]) => ({ text: name, display: name, meta: description })))
+  }, [catalog, input])
 
   useEffect(() => {
-    const clear = () => {
-      setCompletions(prev => (prev.length ? [] : prev))
-      setCompIdx(prev => (prev ? 0 : prev))
-      setCompReplace(prev => (prev ? 0 : prev))
-    }
+    setCompIdx(0)
 
-    if (blocked) {
-      ref.current = ''
-      clear()
-
+    if (blocked || getUiState().gatewayConnected === false) {
       return
     }
-
-    if (input === ref.current) {
-      return
-    }
-
-    ref.current = input
 
     const request = completionRequestForInput(input)
 
     if (!request) {
-      clear()
-
       return
     }
 
+    let active = true
+    const isCurrent = () => active && $slashCatalogOwner.get() === owner
+
     const timer = setTimeout(() => {
-      if (ref.current !== input) {
+      if (!isCurrent()) {
         return
       }
 
@@ -131,7 +137,7 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
 
       gw.request<CompletionResponse>(request.method, params)
         .then(raw => {
-          if (ref.current !== input) {
+          if (!isCurrent()) {
             return
           }
 
@@ -150,34 +156,37 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
               ? fetched.filter(item => item.kind === 'skill')
               : fetched
 
-          setCompletions(items)
-          setCompIdx(0)
           // An inline reference replaces its own token, so the gateway's
           // `replace_from` (an offset into the synthetic `/query` it was sent)
           // doesn't apply — the caller already knows where the token starts.
-          setCompReplace(
+          setReply({ input, owner, items, replaceFrom:
             request.method === 'complete.slash' && !request.skillsOnly ? (r?.replace_from ?? 1) : request.replaceFrom
-          )
+          })
+          setCompIdx(0)
         })
         .catch((e: unknown) => {
-          if (ref.current !== input) {
+          if (!isCurrent()) {
             return
           }
 
-          setCompletions([
+          setReply({ input, owner, failed: true, replaceFrom: request.replaceFrom, items: [
             {
               text: '',
               display: t('libText.completion.unavailable'),
               meta: e instanceof Error && e.message ? e.message : t('libText.completion.unavailableMeta')
             }
-          ])
+          ] })
           setCompIdx(0)
-          setCompReplace(request.replaceFrom)
         })
     }, 60)
 
-    return () => clearTimeout(timer)
-  }, [blocked, gw, input])
+    return () => { active = false; clearTimeout(timer) }
+  }, [blocked, gw, input, owner])
+
+  const current = reply?.input === input && reply.owner === owner ? reply : null
+  const useReply = current && (!current.failed || !cached.length)
+  const completions = blocked ? [] : useReply ? current.items : cached
+  const compReplace = useReply ? current.replaceFrom : cached.length ? 1 : 0
 
   return { completions, compIdx, setCompIdx, compReplace }
 }
