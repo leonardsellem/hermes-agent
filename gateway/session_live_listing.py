@@ -6,7 +6,7 @@ time on the loop cost three full hydrations plus a receipt JSON parse per sessio
 past 10 s, WS writes and the Telegram adapter's ``updater.stop()`` missed their deadlines (#141236).
 
 Here the loop does only in-memory work (authorization and liveness from ``LiveSession``); the store
-facts for a batch of sessions are ONE worker-thread read: picker columns, runtime revision and
+facts for the whole registry are ONE worker-thread read: picker columns, runtime revision and
 generation, pending admissions, and the local receipt target's ``ended_at``.
 """
 from __future__ import annotations
@@ -17,9 +17,6 @@ from dataclasses import dataclass
 
 from gateway.session_contract import SessionHandle, SessionRef
 from hermes_state_runtime import RuntimeStoreError
-
-# Sessions per worker-thread read; each batch is one await, so the loop serves other work between them.
-LISTING_BATCH = 256
 
 _SKIPPED_REASONS = frozenset({'permission_denied', 'profile_mismatch', 'not_found'})
 
@@ -88,23 +85,24 @@ def _readable(authority, actor, session_id) -> bool:
 async def live_entries(authority, actor) -> list[LiveEntry]:
     """Every live session *actor* may read, with its handle, picker row and closed-and-unviewed verdict."""
     from gateway.session_local_close import closed_idle_unviewed
+    readable = [sid for sid in tuple(authority.sessions) if _readable(authority, actor, sid)]
+    if not readable:
+        return []
+    # One submission and one pooled read connection per pass. The await is still the loop's turn, so
+    # #141236 cannot come back: no store read of the walk runs on the loop, and the loop is free for
+    # the whole read rather than between chunks of it.
+    rows, pending = await asyncio.to_thread(_store_facts, authority.db, readable)
+    if authority.retiring or authority.retired:
+        return []  # parked or unserved during the read: nothing here is this profile's to list any more
     entries = []
-    snapshot = tuple(authority.sessions)
-    for start in range(0, len(snapshot), LISTING_BATCH):
-        batch = [sid for sid in snapshot[start:start + LISTING_BATCH] if _readable(authority, actor, sid)]
-        if not batch:
-            continue
-        rows, pending = await asyncio.to_thread(_store_facts, authority.db, batch)
-        if authority.retiring or authority.retired:
-            return []  # parked or unserved during the read: nothing here is this profile's to list any more
-        for sid in batch:
-            live, row = authority.sessions.get(sid), rows.get(sid)
-            if live is None or row is None:
-                continue  # retired during the read, or its row was deleted (``_handle``'s not_found)
-            masked = _masked_pending(live, pending.get(sid, []))
-            state = _execution_state(masked)
-            handle = SessionHandle(SessionRef(authority.profile_id, sid), authority.instance_id, authority.epoch,
-                                   row['runtime_revision'], row['runtime_generation'], state)
-            entries.append(LiveEntry(sid, live, handle, row, masked,
-                                     closed_idle_unviewed(live, state, row['target_ended_at'])))
+    for sid in readable:
+        live, row = authority.sessions.get(sid), rows.get(sid)
+        if live is None or row is None:
+            continue  # retired during the read, or its row was deleted (``_handle``'s not_found)
+        masked = _masked_pending(live, pending.get(sid, []))
+        state = _execution_state(masked)
+        handle = SessionHandle(SessionRef(authority.profile_id, sid), authority.instance_id, authority.epoch,
+                               row['runtime_revision'], row['runtime_generation'], state)
+        entries.append(LiveEntry(sid, live, handle, row, masked,
+                                 closed_idle_unviewed(live, state, row['target_ended_at'])))
     return entries

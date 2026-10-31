@@ -7,7 +7,8 @@ full hydrations and a receipt JSON parse per session and no suspension point. Me
 deadline and the adapter was declared fatal (#141236).
 
 Pinned here: the loop gets a turn while a listing is in flight, no store read of the walk runs on the
-loop thread, the reads are batched (not one per session), and the closed-and-unviewed rule is kept.
+loop thread, a pass is ONE executor submission on ONE read connection (not one per session, nor one
+per 256-row chunk), and the closed-and-unviewed rule is kept.
 """
 import asyncio
 import threading
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
-SESSION_COUNT = 300  # more than one LISTING_BATCH
+SESSION_COUNT = 300  # a registry big enough that a per-session read would show up
 
 
 @pytest_asyncio.fixture
@@ -63,13 +64,32 @@ def _count_reads_by_thread(monkeypatch, db):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('method', ['session.list', 'session.active_list'])
-async def test_a_live_listing_reads_the_store_off_the_loop_in_batches(owner, monkeypatch, method):
+async def test_a_live_listing_reads_the_store_off_the_loop_in_one_read(owner, monkeypatch, method):
     reads = _count_reads_by_thread(monkeypatch, owner.db)
     rows = await owner.listing(method)
     assert len(rows) == (200 if method == 'session.list' else SESSION_COUNT)
     assert reads['loop'] == 0, reads
-    # One worker read per batch, never one per session.
-    assert 0 < reads['worker'] < SESSION_COUNT // 10, reads
+    # One read connection for the whole pass, never one per session or per chunk of the registry.
+    assert reads['worker'] == 1, reads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method', ['session.list', 'session.active_list'])
+async def test_a_live_listing_submits_the_whole_registry_in_one_executor_job(owner, monkeypatch, method):
+    """The registry above one chunk of 256 goes to the executor once, not once per chunk."""
+    from gateway import session_live_listing
+    submitted = []
+    real = asyncio.to_thread
+
+    async def counting(fn, *args, **kwargs):
+        submitted.append(fn)
+        return await real(fn, *args, **kwargs)
+
+    # The module's own `asyncio` name only: `to_thread` is all it uses from it.
+    monkeypatch.setattr(session_live_listing, 'asyncio', SimpleNamespace(to_thread=counting))
+    rows = await owner.listing(method)
+    assert rows
+    assert submitted == [session_live_listing._store_facts], len(submitted)
 
 
 @pytest.mark.asyncio
