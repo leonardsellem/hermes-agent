@@ -443,12 +443,14 @@ def _script_argv(
     return [python_exe, str(path)], env_overlay, None
 
 
-def _run_job_script(
+def _run_job_script_streams(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
-) -> tuple[bool, str]:
-    """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
-    error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
+) -> tuple[bool, str, str, str]:
+    """Execute a cron job's script and return ``(success, stdout, stderr, output)``; on failure
+    *output* is the composed message for the LLM to report. The streams stay separate so a caller
+    can read a verdict from the script's OWN stdout, never from text a stderr block could forge.
+    Env goes through ``build_subprocess_env`` (SECURITY.md
     §2.3). ``workdir`` sets the subprocess cwd only; the Python process cwd is NEVER mutated (an
     ``os.chdir()`` would leak into concurrent gateway sessions).
 
@@ -460,15 +462,15 @@ def _run_job_script(
     """
     from tools.hosted_tool_policy import host_feature_refusal
     if refusal := host_feature_refusal("cron_scripts", "A cron script"):
-        return False, refusal
+        return False, "", "", refusal
     path, err = _resolve_script_path(script_path)
     if path is None:
-        return False, err
+        return False, "", "", err or ""
     script_timeout = _get_script_timeout()
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
-            return False, err
+            return False, "", "", err or ""
         from tools.environments.local import build_subprocess_env
         # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
         # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
@@ -513,7 +515,7 @@ def _run_job_script(
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
                 from cron.cancellation import cancel_reason
-                return False, f"Script cancelled: {cancel_reason(cancel_event)}"
+                return False, "", "", f"Script cancelled: {cancel_reason(cancel_event)}"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_tree(proc)
@@ -524,7 +526,7 @@ def _run_job_script(
                 # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
                 # signalling, so own-session grandchildren are reached too — the unified deadline layer's
                 # tree-kill (#85147, d6a5cb9725).
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                return False, "", "", f"Script timed out after {script_timeout}s: {path}"
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
@@ -540,7 +542,7 @@ def _run_job_script(
             stdout = redact_sensitive_text(stdout)
             stderr = redact_sensitive_text(stderr)
         except Exception as e:
-            logger.warning("Failed to redact sensitive text from output: %s", e)
+            logger.warning("Failed to redact sensitive text from output: %s", e, exc_info=True)
             stdout = stderr = "[REDACTED - redaction failed]"
 
         if proc.returncode != 0:
@@ -549,10 +551,21 @@ def _run_job_script(
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
-            return False, "\n".join(parts)
-        return True, stdout
+            return False, stdout, stderr, "\n".join(parts)
+        return True, stdout, stderr, stdout
     except Exception as exc:
-        return False, f"Script execution failed: {exc}"
+        logger.warning("Cron script '%s' run raised: %s", script_path, exc, exc_info=True)
+        return False, "", "", f"Script execution failed: {exc}"
+
+
+def _run_job_script(
+    script_path: str, workdir: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+) -> tuple[bool, str]:
+    """``(success, output)`` for callers that only report the script's message."""
+    ok, _stdout, _stderr, output = _run_job_script_streams(
+        script_path, workdir=workdir, cancel_event=cancel_event, interpreter=interpreter)
+    return ok, output
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:
@@ -572,14 +585,14 @@ def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str, str]:
     """Run a cron script while heartbeating its owned one-shot claim. A long script can outlive
     the stale-claim TTL; without a heartbeat another scheduler would re-dispatch the one-shot.
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
-    def run() -> tuple[bool, str]:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+    def run() -> tuple[bool, str, str, str]:
+        return _run_job_script_streams(script_path, workdir=workdir, cancel_event=cancel_event,
+                                       interpreter=job.get("interpreter"))
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")
