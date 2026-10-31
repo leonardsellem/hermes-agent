@@ -18,6 +18,23 @@ from typing import Optional
 logger = logging.getLogger("cron.scheduler")
 
 
+def _script_payload(script_output: str) -> dict:
+    """The script's outcome payload: its last non-empty STDOUT line when that line is a JSON
+    object, else ``{}``. The one reader of the script contract (``outcome``, ``should_retry``,
+    ``wakeAgent``) — a payload is a JSON line, never something sniffed out of prose.
+
+    Callers pass the script's stdout stream, never a composed alert text: a failure report embeds
+    stderr, and text from there must not be able to declare an outcome."""
+    stripped_lines = [line for line in (script_output or "").splitlines() if line.strip()]
+    if not stripped_lines:
+        return {}
+    try:
+        payload = json.loads(stripped_lines[-1].strip())
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _parse_wake_gate(script_output: str) -> bool:
     """Wake gate: False only if the last non-empty stdout line is JSON ``{"wakeAgent": false}``
     (agent skipped entirely — no LLM run, no delivery); anything else wakes normally.
@@ -25,14 +42,7 @@ def _parse_wake_gate(script_output: str) -> bool:
     Any other output (non-JSON, missing flag, gate absent, or ``wakeAgent: true``) means wake the agent
     normally. See #1232.
     """
-    stripped_lines = [line for line in (script_output or "").splitlines() if line.strip()]
-    if not stripped_lines:
-        return True
-    try:
-        gate = json.loads(stripped_lines[-1].strip())
-    except (json.JSONDecodeError, ValueError):
-        return True
-    return not isinstance(gate, dict) or gate.get("wakeAgent", True) is not False
+    return _script_payload(script_output).get("wakeAgent", True) is not False
 
 
 def _prepend_context_block(prompt: str, heading: str, intro: str, body: str) -> str:

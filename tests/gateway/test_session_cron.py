@@ -292,7 +292,7 @@ def _stub_gate(monkeypatch, case):
             context_block=None, error='source down' if failed else None))
     if case == 'wake_gate_false':
         monkeypatch.setattr(scheduler, '_run_job_script_with_claim_heartbeat',
-                            lambda *a, **k: (True, '{"wakeAgent": false}'))
+                            lambda *a, **k: (True, '{"wakeAgent": false}', "", '{"wakeAgent": false}'))
     if case == 'config_unparseable':
         def _refuse(*_a, **_k):
             from hermes_cli.config import InvalidUserConfigError

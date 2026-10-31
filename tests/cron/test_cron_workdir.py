@@ -371,7 +371,7 @@ class TestRunJobTerminalCwd:
 
         def run_script(job, script_path, workdir=None, cancel_event=None):
             observed["script_workdir"] = workdir
-            return True, '{"wakeAgent": false}'
+            return True, '{"wakeAgent": false}', "", '{"wakeAgent": false}'
 
         monkeypatch.setattr(
             sched, "_run_job_script_with_claim_heartbeat", run_script
