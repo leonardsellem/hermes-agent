@@ -39,6 +39,11 @@ _FAILURE_TYPE_ORDER = (
     ("script", ("script", "no_agent")),
     ("agent", ("agent", "model", "provider", "inference")),
 )
+# Outcomes a run payload may declare that are NOT failures. They are the first rung of the
+# order above: the run's own ``{"outcome": "refused"}`` outranks every error-text bucket, so a
+# refusal whose note also says "timeout"/"auth" can never be reclassified as one of those.
+# A refusal is only ever read from the payload, never matched as error text.
+PAYLOAD_OUTCOMES = ("refused",)
 MAX_ERROR_CHARS = 500
 _MAX_SIGNATURE_ERROR_CHARS = 200
 # Measured durations ("idle for 603s", "retry in 12.5 seconds") differ run to run for the same
@@ -138,8 +143,12 @@ def _incident_id(job_id: str, error_sig: str) -> str:
     return f"{job_id[:6]}_{error_sig}"
 
 
-def _classify_failure_type(error: str) -> str:
-    """Classify a failure from error-text keywords; ``unknown`` is the default."""
+def _classify_failure_type(error: str, outcome: Optional[str] = None) -> str:
+    """Classify a run from its payload-declared outcome and error-text keywords; ``unknown``
+    is the default. ``outcome`` (the script payload's ``outcome`` field) wins over the text
+    buckets: a declared refusal is ``refused`` however the note is worded."""
+    if outcome in PAYLOAD_OUTCOMES:
+        return str(outcome)
     text = _normalize_error(error)
     if not text:
         return "unknown"

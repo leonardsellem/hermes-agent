@@ -302,7 +302,9 @@ def _job_warnings(job: dict[str, Any]) -> list[str]:
     # only job-level trace left.
     last_failure = job.get("last_failure")
     if isinstance(last_failure, dict) and last_failure.get("detail"):
-        recovered = str(job.get("last_status") or "") in {"ok", "delivery_queued"}
+        # A refusal books last_status=ok without healing anything, so it is not a recovery.
+        recovered = (str(job.get("last_status") or "") in {"ok", "delivery_queued"}
+                     and job.get("last_outcome") != "refused")
         lines.append(color(
             f"⚠ Last failure at {last_failure.get('at', '?')}: "
             f"{_short_reason(last_failure['detail'])}" + (" — recovered since" if recovered else ""),

@@ -158,8 +158,10 @@ def test_guard_is_released_and_job_refires_after_sessiondb_hang(owner_run, monke
 def test_wake_gate_false_never_opens_session_db(owner_run):
     _, job, execution_id, agent_cls = owner_run
     job["script"] = "gate.py"
+    payload = '{"wakeAgent": false}'
     with patch("hermes_state_registry.acquire") as acquire, \
-         patch("cron.scheduler._run_job_script_with_claim_heartbeat", return_value=(True, '{"wakeAgent": false}')):
+         patch("cron.scheduler._run_job_script_with_claim_heartbeat",
+               return_value=(True, payload, "", payload)):
         success, _, _, error = scheduler.run_job(job, execution_id=execution_id)
     assert success and error is None
     acquire.assert_not_called()

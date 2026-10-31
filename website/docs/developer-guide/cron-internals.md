@@ -79,6 +79,15 @@ Desktop routine inspector) maps each literal explicitly — a consumer must neve
 | `delivery_failed` | Agent run succeeded, but the output never reached its target | `last_delivery_error` (`last_error` is `null`) |
 | `blocked_config` | Pre-dispatch validation refused to burn a run | `last_error` |
 
+`last_outcome` carries the run payload's declared outcome when it is not a failure. A no_agent
+script whose last stdout line (on either exit code; stderr is never read) is
+`{"outcome": "refused"}` is a deliberate no-op: the run books `last_status = "ok"` with
+`last_outcome = "refused"`, delivers nothing, mints no incident, and leaves
+`failure_streak`/`last_failure` untouched (a refusal is neither a failure nor a recovery) — so
+`hermes cron list` keeps showing the older failure without a "recovered since". A payload's
+`"should_retry": false` suppresses the unreachable-model re-run ladder for that job; any later run
+that is not a refusal clears `last_outcome`.
+
 ### Queued delivery lifecycle and write-back
 
 An agent run with a delivery target and an `execution_id` does not send inline: it

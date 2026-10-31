@@ -2336,33 +2336,45 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
 
 def _record_run_outcome(
     job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
-    status: Optional[str], now: str,
+    status: Optional[str], now: str, run_outcome: Optional[str] = None,
 ) -> None:
-    """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
+    """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims.
+
+    ``run_outcome`` is the run payload's declared outcome; a refusal books ``last_outcome`` and
+    leaves the streak alone (not a failure, not a recovery) — see cron/incidents.py."""
     job["last_run_at"] = now
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
+    # A payload refusal outranks every error-text bucket: the payload's word, never a keyword.
+    from cron.incidents import _classify_failure_type
+
+    refused = _classify_failure_type(error or "", run_outcome) == "refused"
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
     job["last_error"] = None if success else error
-    if success:
-        # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
-        # the forward-failure stamp so it only describes CURRENT auto-fire health.
-        job.pop("preflight_alerted", None)
-        job.pop("last_fire_error", None)
-        job["failure_streak"] = 0
+    if refused:
+        # Deliberate no-op: last_failure and failure_streak stay exactly as they were.
+        job["last_outcome"] = "refused"
     else:
-        # Consecutive agent-failure streak; delivery failures do NOT count
-        # (scheduler._failure_streak_nudge).
-        job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
-        # Sticky last-failure stamp (#118354): the next success resets last_status and
-        # failure_streak, which erases the only job-level trace that a run ever failed —
-        # a monitor sampling jobs.json then sees a permanently green job. last_failure
-        # survives success (latest failure wins); the recency window is the consumer's
-        # call. Delivery failures keep their own sticky last_delivery_error.
-        job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
+        job.pop("last_outcome", None)
+        if success:
+            # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and
+            # clear the forward-failure stamp so it only describes CURRENT auto-fire health.
+            job.pop("preflight_alerted", None)
+            job.pop("last_fire_error", None)
+            job["failure_streak"] = 0
+        else:
+            # Consecutive agent-failure streak; delivery failures do NOT count
+            # (scheduler._failure_streak_nudge).
+            job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+            # Sticky last-failure stamp (#118354): the next success resets last_status and
+            # failure_streak, which erases the only job-level trace that a run ever failed —
+            # a monitor sampling jobs.json then sees a permanently green job. last_failure
+            # survives success (latest failure wins); the recency window is the consumer's
+            # call. Delivery failures keep their own sticky last_delivery_error.
+            job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
     job["last_delivery_error"] = delivery_error
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
@@ -2435,6 +2447,8 @@ def mark_job_run(
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
+    run_outcome: Optional[str] = None,
+    should_retry: Optional[bool] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2456,6 +2470,10 @@ def mark_job_run(
     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
     consumed fire when the provider reopens; manual runs retain the natural schedule
     (cron/quota_hold.py, #89376).
+
+    ``run_outcome``: the run payload's declared outcome; ``"refused"`` records a deliberate
+    no-op (``last_outcome``, streak untouched). ``should_retry``: the payload's own verdict —
+    ``False`` forbids the unreachable-model re-run ladder from re-running this failure.
     """
     def apply(jobs, _i, job):
         if execution_id is not None and execution_id in job.get("canonical_completions", []):
@@ -2468,7 +2486,8 @@ def mark_job_run(
                     job_id)
                 return False
         now = _hermes_now().isoformat()
-        _record_run_outcome(job, success, error, delivery_error, status, now)
+        _record_run_outcome(
+            job, success, error, delivery_error, status, now, run_outcome=run_outcome)
         if execution_id is not None:  # retire ids recovery can no longer replay; latest stays last
             from cron.scheduler_authority import replayable_completions as live
             job["canonical_completions"] = [*live(job_id, job.get("canonical_completions")), execution_id]
@@ -2476,7 +2495,10 @@ def mark_job_run(
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
 
-        if not success and model_unreachable and not is_terminal_job(job):
+        if (
+            not success and model_unreachable and not is_terminal_job(job)
+            and should_retry is not False
+        ):
             plan_retry(job)
         else:
             # Any run that reached the model (either outcome) resets the re-run ladder.

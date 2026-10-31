@@ -1576,8 +1576,8 @@ class TestRunJobWakeGate:
         from cron import scheduler
         from cron import scheduler_script as sched_script
 
-        with patch.object(sched_script, "_run_job_script",
-                          return_value=(True, '{"wakeAgent": false}')), \
+        with patch.object(sched_script, "_run_job_script_streams",
+                          return_value=(True, '{"wakeAgent": false}', "", '{"wakeAgent": false}')), \
              patch("run_agent.AIAgent") as agent_cls:
             success, _doc, final, err = _run_owned_job(self._make_job(), tmp_path)
 
@@ -1597,8 +1597,8 @@ class TestRunJobWakeGate:
         agent.run_conversation = MagicMock(return_value={
             "final_response": "ok", "messages": []
         })
-        with patch.object(sched_script, "_run_job_script",
-                          return_value=(True, script_output)), \
+        with patch.object(sched_script, "_run_job_script_streams",
+                          return_value=(True, script_output, "", script_output)), \
              patch("run_agent.AIAgent", return_value=agent) as agent_cls:
             success, _doc, _final, err = _run_owned_job(self._make_job(), tmp_path)
 

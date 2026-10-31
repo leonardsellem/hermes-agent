@@ -1544,14 +1544,33 @@ def _run_no_agent_job(
     # Pass workdir as subprocess cwd; never os.chdir() (leaks into concurrent gateway sessions).
     _job_workdir = _resolve_job_workdir(job, job_id)
     try:
-        ok, output = _run_job_script_with_claim_heartbeat(
+        ok, script_stdout, _script_stderr, output = _run_job_script_with_claim_heartbeat(
             job, script_path, workdir=_job_workdir, cancel_event=cancel_event)
     except Exception as exc:
         logger.exception("Job '%s': script execution raised unexpectedly", job_id)
-        ok, output = False, f"Script execution failed: {exc}"
+        ok, script_stdout, output = False, "", f"Script execution failed: {exc}"
 
     now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
+
+    # The script's own terminal outcome answers for this run: a deliberate refusal is a healthy
+    # no-op on EITHER exit code (a refusing script may not have a failure to report). Read from the
+    # script's own stdout: the composed failure text embeds stderr, which must never forge a verdict.
+    payload = _script_payload(script_stdout)
+    if isinstance(payload.get("should_retry"), bool):
+        job["_should_retry"] = payload["should_retry"]
+    if str(payload.get("outcome") or "").strip() == "refused":
+        job["_run_outcome"] = "refused"
+        reason = payload.get("reason_code") or payload.get("reason") or payload.get("note")
+        logger.info(
+            "Job '%s' (no_agent): refused (%s) — silent, streak untouched",
+            job_id, reason or "no reason given")
+        return (
+            True,
+            f"{header}**Status:** refused ({reason or 'no reason given'})\n\n{output}\n",
+            SILENT_MARKER,
+            None,
+        )
 
     if not ok:
         # Deliver the error: a silently broken watchdog is the worst-case outcome.
@@ -2321,6 +2340,7 @@ def _prepare_job_prompt(
     # happens inside the main try, right before the agent is constructed — after every early-return path
     # (#96290).
     prerun_script = None
+    prerun_streams = None  # (success, output) for _build_job_prompt's wake-gate cache
     script_path = job.get("script")
     if script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(
@@ -2329,7 +2349,13 @@ def _prepare_job_prompt(
             workdir=_resolve_job_workdir(job, job_id),
             cancel_event=cancel_event,
         )
-        _ran_ok, _script_output = prerun_script
+        _ran_ok, _script_stdout, _script_stderr, _script_output = prerun_script
+        prerun_streams = (_ran_ok, _script_output)
+        # Same script contract on the agent path: a pre-run script that says should_retry=false
+        # forbids the unreachable-model re-run ladder (the only automatic retry a job has).
+        _pre_payload = _script_payload(_script_stdout)
+        if isinstance(_pre_payload.get("should_retry"), bool):
+            job["_should_retry"] = _pre_payload["should_retry"]
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             note_cron_skipped(job)
@@ -2343,7 +2369,7 @@ def _prepare_job_prompt(
 
     try:
         prompt = _build_job_prompt(
-            job, prerun_script=prerun_script, extra_prompt=extra_prompt,
+            job, prerun_script=prerun_streams, extra_prompt=extra_prompt,
             runtime_data_prompt=monitor_context,
         )
     except CronPromptInjectionBlocked as block_exc:
@@ -2995,6 +3021,10 @@ def _compose_run_delivery(
     silent_alert, incident_acked, failure_incident_id)``; ``silent_alert``: an alert-once marker
     says the operator was already told, deliver nothing. ``agent_declared``: *error* is the
     agent's own ``[CRON_FAILURE]`` evidence, delivered verbatim."""
+    if job.get("_run_outcome") == "refused":
+        # A payload refusal is a deliberate no-op: nothing to deliver, no incident to mint, and
+        # no recovery to record — the failure history must stay exactly as it was.
+        return "", False, False, False, None
     err = str(error) if error else ""
     # Failed jobs always deliver, except blocked-config runs, which alert exactly ONCE.
     blocked_config_silent = BLOCKED_CONFIG_SILENT_MARKER in err
@@ -4441,7 +4471,7 @@ from cron.scheduler_script import (
 from cron.scheduler_prompt import (
     _PROMPT_FRAME, _PROMPT_HEADING, _PROMPT_SEPARATOR, _RESPONSE_FRAME, _RESPONSE_HEADING,
     _RESPONSE_TERMINATOR, _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil,
-    _parse_wake_gate,
+    _parse_wake_gate, _script_payload,
 )
 from cron.scheduler_preflight import (
     BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,

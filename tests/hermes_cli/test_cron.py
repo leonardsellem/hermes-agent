@@ -683,3 +683,21 @@ class TestSlashCronRunSkipped:
         out = capsys.readouterr().out
         assert "Job is paused/disabled; resume it before running." in out
         assert "Triggered" not in out and "next scheduler tick" not in out
+
+
+class TestCronWarningsRefusal:
+    """A refusal books ``last_status=ok`` without healing anything, so ``hermes cron list`` must
+    not report the older failure as recovered."""
+
+    def test_refused_run_does_not_read_as_recovered(self):
+        job = {
+            "id": "j1",
+            "name": "watch",
+            "schedule": {"kind": "interval", "minutes": 5},
+            "last_status": "ok",
+            "last_failure": {"at": "2026-10-30 10:00:00", "detail": "connect timeout"},
+        }
+        assert any("recovered since" in line for line in cron_cli._job_warnings(job))
+
+        job["last_outcome"] = "refused"
+        assert not any("recovered since" in line for line in cron_cli._job_warnings(job))

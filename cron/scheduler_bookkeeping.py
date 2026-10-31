@@ -61,6 +61,16 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    # Payload-declared terminal outcome + its retry verdict (cron.scheduler._run_no_agent_job).
+    # A refusal is recorded as such and leaves the streak alone; should_retry=False blocks the
+    # unreachable-model ladder from re-running a job that said not to. Absent keys keep the
+    # call shape of every payload-less run unchanged.
+    run_outcome = job.pop("_run_outcome", None)
+    if run_outcome is not None:
+        mark_kwargs["run_outcome"] = run_outcome
+    should_retry = job.pop("_should_retry", None)
+    if should_retry is not None:
+        mark_kwargs["should_retry"] = should_retry
     from cron.scheduler_authority import journal_path
     journal = journal_path(job['id'], execution_id)
     if not job.get('no_agent'):
