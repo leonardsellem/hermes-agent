@@ -6,12 +6,14 @@ ignored) and must fire on BOTH the CLI-interactive path and the async gateway
 path, so external tools like macOS notifiers can be alerted regardless of
 which surface the user is on.
 """
-from unittest.mock import patch
+from dataclasses import replace
+import threading
+from unittest.mock import Mock, patch
 
 import pytest
 
 import tools.approval as approval_module
-from tools import approval_context
+from tools import approval_context, approval_prompt
 from tools import approval_smart
 from tools.approval import check_all_command_guards, check_execute_code_guard, clear_session
 from tools.approval_context import set_current_session_key
@@ -393,3 +395,142 @@ class TestClassicCliPromptsFireGatewayTwinHooks:
         result, captured = _capture_hooks(lambda: _request_protected_instruction_approval(["AGENTS.md"]))
         assert result is not None and "has NOT consented" in result
         assert captured == []
+
+
+@pytest.fixture
+def protected_transport(isolated_session, monkeypatch):
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(
+        name="fixture-protected-approval", version="1.0.0", description="fixture",
+        source="user", key="fixture-protected-approval"), manager)
+    monkeypatch.setattr(approval_prompt, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(approval_context, "_get_approval_transport_config", lambda: ("phone", "builtin"))
+    monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 1)
+    monkeypatch.setattr(approval_context, "_no_user_can_answer", lambda: False)
+    builtin = Mock(return_value="once")
+    gateway = Mock(return_value={"choice": "once", "resolved": True})
+    monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", builtin)
+    monkeypatch.setattr("tools.terminal_tool._get_approval_callback", lambda: builtin)
+    monkeypatch.setattr("tools.approval_gateway_wait._await_gateway_decision", gateway)
+    return context, builtin, gateway
+
+
+class TestProtectedInstructionTransport:
+    def test_multi_file_gate_uses_one_request(self, protected_transport, tmp_path):
+        from tools.file_tools_write_guards import _check_protected_instruction_write
+
+        context, builtin, gateway = protected_transport
+        seen = []
+        context.register_approval_transport(
+            "phone", lambda request: seen.append(request) or request.respond("once"))
+        paths = [str(tmp_path / name) for name in ("AGENTS.md", "CLAUDE.md", "notes.txt", "AGENTS.md")]
+        assert _check_protected_instruction_write(paths) is None
+        assert len(seen) == 1
+        assert seen[0].command == "<write to AGENTS.md, CLAUDE.md>"
+        assert not any((tmp_path / name).exists() for name in ("AGENTS.md", "CLAUDE.md", "notes.txt"))
+        builtin.assert_not_called()
+        gateway.assert_not_called()
+
+    @pytest.mark.parametrize("surface", ["headless", "cli", "gateway"])
+    @pytest.mark.parametrize("choice", ["once", "deny"])
+    def test_selected_transport_is_once_only_and_fires_one_hook_pair(
+        self, protected_transport, isolated_session, monkeypatch, surface, choice
+    ):
+        context, builtin, gateway = protected_transport
+        seen = []
+
+        def present(request):
+            seen.append(request)
+            return request.respond(choice)
+
+        context.register_approval_transport("phone", present)
+        if surface == "headless":
+            monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+            monkeypatch.setattr(approval_context, "_no_user_can_answer", lambda: True)
+            monkeypatch.setattr("tools.terminal_tool._get_approval_callback", lambda: None)
+        elif surface == "gateway":
+            approval_module.register_gateway_notify(isolated_session, lambda _data: None)
+        try:
+            result, hooks = _capture_hooks(lambda: _request_protected_instruction_approval(["AGENTS.md"]))
+        finally:
+            approval_module.unregister_gateway_notify(isolated_session)
+
+        assert (result is None) is (choice == "once")
+        assert len(seen) == 1
+        request = seen[0]
+        assert request.allowed_choices == ("once", "deny")
+        assert request.pattern_keys == ("protected_instruction_file",)
+        assert request.surface == ("gateway" if surface == "gateway" else "cli")
+        assert [name for name, _ in hooks] == ["pre_approval_request", "post_approval_response"]
+        pre, post = (kwargs for _, kwargs in hooks)
+        assert pre["surface"] == post["surface"] == "transport:phone"
+        assert pre["request_id"] == post["request_id"] == request.request_id
+        assert pre["request_digest"] == post["request_digest"] == request.digest
+        assert post["choice"] == choice
+        builtin.assert_not_called()
+        gateway.assert_not_called()
+
+    def test_later_operation_requires_a_new_answer(self, protected_transport):
+        context, builtin, gateway = protected_transport
+        seen = []
+
+        def present(request):
+            seen.append(request)
+            return request.respond("once" if len(seen) == 1 else "deny")
+
+        context.register_approval_transport("phone", present)
+        assert _request_protected_instruction_approval(["AGENTS.md"]) is None
+        denied = _request_protected_instruction_approval(["AGENTS.md"])
+        assert denied is not None and "denied by the user" in denied
+        assert len(seen) == 2
+        assert seen[0].request_id != seen[1].request_id
+        assert seen[0].digest != seen[1].digest
+        assert approval_module._session_approved == {}
+        assert approval_module._permanent_approved == set()
+        builtin.assert_not_called()
+        gateway.assert_not_called()
+
+    @pytest.mark.parametrize("case,failure", [
+        ("unavailable", "unavailable"), ("error", "error"), ("bad_type", "invalid"),
+        ("bad_choice", "invalid"), ("session", "invalid"), ("always", "invalid"),
+        ("wrong_id", "stale"), ("wrong_digest", "stale"),
+        ("expired", "timeout"), ("timeout", "timeout"), ("interrupted", "interrupted"),
+    ])
+    def test_failure_never_downgrades_to_native_even_with_builtin_fallback(
+        self, protected_transport, isolated_session, monkeypatch, case, failure
+    ):
+        import hermes_cli.approval_transport as transport_module
+
+        context, builtin, gateway = protected_transport
+
+        def present(request):
+            if case == "error":
+                raise RuntimeError("fixture transport offline")
+            return {
+                "bad_type": {"choice": "once"},
+                "wrong_id": replace(request.respond("once"), request_id="stale"),
+                "wrong_digest": replace(request.respond("once"), request_digest="changed"),
+            }.get(case, request.respond(case if case in {"session", "always", "bad_choice"} else "once"))
+
+        if case != "unavailable":
+            context.register_approval_transport("phone", present)
+        if case == "expired":
+            main_thread = threading.get_ident()
+            monkeypatch.setattr(transport_module.time, "monotonic",
+                                lambda: 0.0 if threading.get_ident() == main_thread else 2.0)
+        elif case == "timeout":
+            monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 0)
+        elif case == "interrupted":
+            monkeypatch.setattr(approval_prompt, "is_interrupted", lambda: True)
+        approval_module.register_gateway_notify(isolated_session, lambda _data: None)
+        try:
+            result = _request_protected_instruction_approval(["AGENTS.md"])
+        finally:
+            approval_module.unregister_gateway_notify(isolated_session)
+
+        assert result is not None and f"transport failed ({failure})" in result
+        assert "has NOT consented" in result
+        builtin.assert_not_called()
+        gateway.assert_not_called()
