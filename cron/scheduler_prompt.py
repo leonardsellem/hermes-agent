@@ -18,6 +18,23 @@ from typing import Optional
 logger = logging.getLogger("cron.scheduler")
 
 
+def _script_payload(script_output: str) -> dict:
+    """The script's outcome payload: its last non-empty STDOUT line when that line is a JSON
+    object, else ``{}``. The one reader of the script contract (``outcome``, ``should_retry``,
+    ``wakeAgent``) — a payload is a JSON line, never something sniffed out of prose.
+
+    Callers pass the script's stdout stream, never a composed alert text: a failure report embeds
+    stderr, and text from there must not be able to declare an outcome."""
+    stripped_lines = [line for line in (script_output or "").splitlines() if line.strip()]
+    if not stripped_lines:
+        return {}
+    try:
+        payload = json.loads(stripped_lines[-1].strip())
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _parse_wake_gate(script_output: str) -> bool:
     """Wake gate: False only if the last non-empty stdout line is JSON ``{"wakeAgent": false}``
     (agent skipped entirely — no LLM run, no delivery); anything else wakes normally.
@@ -25,14 +42,7 @@ def _parse_wake_gate(script_output: str) -> bool:
     Any other output (non-JSON, missing flag, gate absent, or ``wakeAgent: true``) means wake the agent
     normally. See #1232.
     """
-    stripped_lines = [line for line in (script_output or "").splitlines() if line.strip()]
-    if not stripped_lines:
-        return True
-    try:
-        gate = json.loads(stripped_lines[-1].strip())
-    except (json.JSONDecodeError, ValueError):
-        return True
-    return not isinstance(gate, dict) or gate.get("wakeAgent", True) is not False
+    return _script_payload(script_output).get("wakeAgent", True) is not False
 
 
 def _prepend_context_block(prompt: str, heading: str, intro: str, body: str) -> str:
@@ -195,16 +205,16 @@ def _load_cron_skill_parts(job: dict, skill_names: list[str]) -> list[str]:
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
-    from agent.skill_commands import _inject_skill_config
+    from agent.skill_commands import _inject_skill_config, ambiguous_skill_label
     from agent.skill_utils import normalize_skill_lookup_name
     job_label = job.get("name", job.get("id"))
     task_id = str(job.get("id") or "") or None
     parts: list[str] = []
     skipped: list[str] = []
 
-    def _skip(msg: str, *args) -> None:
+    def _skip(msg: str, *args, label: str | None = None) -> None:
         logger.warning("Cron job '%s': " + msg, job_label, *args)
-        skipped.append(skill_name)
+        skipped.append(label or skill_name)
 
     for skill_name in skill_names:
         # Bundles shadow same-slug skills, mirroring the CLI/gateway slash-command path.
@@ -224,6 +234,9 @@ def _load_cron_skill_parts(job: dict, skill_names: list[str]) -> list[str]:
             loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
         except (json.JSONDecodeError, TypeError):
             _skip("skill '%s' returned invalid JSON, skipping", skill_name)
+            continue
+        if ambiguous := ambiguous_skill_label(skill_name, loaded):
+            _skip("%s — skipping", ambiguous, label=ambiguous)
             continue
         if not loaded.get("success"):
             _skip(
@@ -442,6 +455,6 @@ def _block_and_pause_job(
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
-from cron import scheduler as _sched  # noqa: E402
-from cron import scheduler_delivery as _delivery  # noqa: E402
-from cron import scheduler_script as _script  # noqa: E402
+from cron import scheduler as _sched
+from cron import scheduler_delivery as _delivery
+from cron import scheduler_script as _script

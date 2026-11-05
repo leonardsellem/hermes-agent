@@ -6,6 +6,7 @@ import {
   backendRestarting,
   describeCredentialWarning,
   describeRpcError,
+  describeShellExecError,
   describeSlashExecError,
   describeTurnFailure,
   isVersionSkewError,
@@ -86,12 +87,25 @@ describe('describeRpcError', () => {
     }
   })
 
-  it('keeps the timeout seconds but drops the method', () => {
-    const text = describeRpcError(new Error('request timed out after 120s: slash.exec'))
+  it('deadline-names-method-not-model', () => {
+    const logged: string[] = []
 
-    expect(text).toContain('120s')
-    expect(text).not.toContain('slash.exec')
-    expect(text).toContain('/logs')
+    setRpcErrorLogSink(line => {
+      logged.push(line)
+    })
+
+    try {
+      const text = describeRpcError(new Error('request timed out after 120s: session.list'))
+
+      expect(text).toContain('session.list')
+      expect(text).toContain('120s')
+      expect(text).not.toMatch(/model|token/i)
+      expect(text).toContain('/logs')
+      // The wire line the operator can quote stays in /logs.
+      expect(logged.join('\n')).toContain('request timed out after 120s: session.list')
+    } finally {
+      setRpcErrorLogSink(null)
+    }
   })
 
   it('explains a stale session id as saved-and-reopenable, not as loss', () => {
@@ -223,6 +237,10 @@ describe('backend lifecycle copy', () => {
     expect(stderrLooksLikeProblem('[gateway-turn] ValueError: nope')).toBe(true)
     expect(stderrLooksLikeProblem('ValueError: nope')).toBe(true)
     expect(stderrLooksLikeProblem('INFO hermes.mcp: discovered 3 servers')).toBe(false)
+    // The canonical bootstrap's verdict (and its remedy line) is the reason a TUI cannot connect.
+    expect(stderrLooksLikeProblem('gateway incompatible: runtime_protocol')).toBe(true)
+    expect(stderrLooksLikeProblem('gateway inaccessible: profile_parked')).toBe(true)
+    expect(stderrLooksLikeProblem('the gateway incompatible: x')).toBe(false)
   })
 
   it('ignores dependency warning lines and does not call the failure a "backend" problem', () => {
@@ -280,5 +298,35 @@ describe('locale-aware resolution', () => {
     expect(backendRestarting()).toBe('RESTART-XX')
     expect(promptTimeoutNotice('sudo', 'timeout')).toBe('SUDO-XX')
     expect(describeTurnFailure({ error_surface: { code: 'auth', layer: 'auth' } }).split('\n')[0]).toBe('AUTH-XX // XX')
+  })
+})
+
+describe('describeShellExecError', () => {
+  it.each(['docker', 'ssh'])('names the %s backend and points at the agent (#134889 TUI-16)', backend => {
+    const err = new JsonRpcGatewayError('unsupported_terminal_backend', {
+      code: 4001,
+      data: { reason: 'unsupported_terminal_backend', field: 'terminal.backend', detail: backend }
+    })
+
+    const text = describeShellExecError(err)
+
+    expect(text).toContain(`terminal backend is ${backend}`)
+    expect(text).toContain('Ask the agent to run it instead')
+    expect(text).not.toContain('unsupported_terminal_backend')
+  })
+
+  it('still names the refusal when an older gateway sends no backend, and passes other errors through', () => {
+    const bare = new JsonRpcGatewayError('unsupported_terminal_backend', {
+      code: 4001,
+      data: { reason: 'unsupported_terminal_backend' }
+    })
+
+    const text = describeShellExecError(bare)
+
+    expect(text).toContain("this session's terminal backend isn't local")
+    expect(text).toContain('Ask the agent to run it instead.')
+    expect(text).not.toContain('not local')
+    expect(text).not.toContain("agent's terminal runs inside")
+    expect(describeShellExecError(new JsonRpcGatewayError('dangerous_command', { code: 4001 }))).toBe('dangerous_command')
   })
 })

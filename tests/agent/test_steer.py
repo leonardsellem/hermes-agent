@@ -11,6 +11,7 @@ import threading
 
 import pytest
 
+from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
 from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
 from run_agent import AIAgent
 from tools.registry import registry
@@ -78,6 +79,55 @@ class TestSteerDrain:
         agent.steer("hello")
         assert agent._drain_pending_steer() == "hello"
         assert agent._pending_steer is None
+
+    def test_withdraw_takes_back_one_unconsumed_ticket_and_keeps_the_rest(self):
+        agent = _bare_agent()
+        agent.steer("first")
+        agent.steer("  two\nlines  ", ticket="t2")
+        agent.steer("two")  # the same text as a line of t2, without a ticket
+        agent.steer("last", ticket="t4")
+        assert agent.withdraw_steer("t2") is True
+        assert agent._pending_steer == "first\ntwo\nlast"
+        assert agent.withdraw_steer("missing") is False
+        assert agent.withdraw_steer("t4") is True
+        assert agent._pending_steer == "first\ntwo"
+
+    def test_withdraw_after_a_drain_took_the_ticket_is_refused_even_if_its_text_is_buffered_again(self):
+        agent = _bare_agent()
+        agent.steer("alpha", ticket="a")
+        assert agent._drain_pending_steer() == "alpha"
+        agent.steer("alpha", ticket="b")
+        assert agent.withdraw_steer("a") is False, "a drain consumed a"
+        assert agent.withdraw_steer("b") is True
+        assert agent._pending_steer is None
+
+    def test_a_drained_steer_put_back_undelivered_keeps_its_ticket(self):
+        from agent.agent_runtime_helpers import _requeue_pending_steer
+        agent = _bare_agent()
+        agent.steer("note")
+        agent.steer("queued prompt", ticket="t")
+        drained = agent._drain_pending_steer() or ""
+        _requeue_pending_steer(agent, drained)  # no tool result took it
+        assert agent._pending_steer == "note\nqueued prompt"
+        assert agent.withdraw_steer("t") is True
+        assert agent._pending_steer == "note"
+
+    def test_the_leftover_drain_hands_back_only_ticketless_steers(self):
+        agent = _bare_agent()
+        agent.steer("typed /steer")
+        agent.steer("queued prompt", ticket="t")
+        assert agent._drain_leftover_steer() == "typed /steer"
+        assert agent._pending_steer == "queued prompt"
+        assert agent._drain_leftover_steer() is None
+        assert agent.withdraw_steer("t") is True
+        assert agent._pending_steer is None
+
+    def test_a_hard_stop_drops_a_ticket_unread(self):
+        agent = _bare_agent()
+        agent.steer("queued prompt", ticket="t")
+        agent.clear_interrupt(hard_cancel=True)
+        assert agent._pending_steer is None
+        assert agent.withdraw_steer("t") is True, "dropped unread: never delivered"
 
 
 
@@ -388,7 +438,7 @@ class TestEmptyHiddenAssistantRehealRegression:
         assert placeholder["role"] == "assistant"
         assert placeholder["content"] == ""
         assert placeholder["display_kind"] == "hidden"
-        assert placeholder["api_content"] == "[response interrupted]"
+        assert placeholder["api_content"] == _INTERRUPTED_PLACEHOLDER
         # The user correction keeps clean text in content and the interruption
         # context only in its own api_content sidecar.
         assert correction["role"] == "user"
@@ -418,7 +468,7 @@ class TestEmptyHiddenAssistantRehealRegression:
         ]
         healed = repair_empty_non_final_messages(rows)
         assistant = next(m for m in healed if m.get("role") == "assistant")
-        assert assistant["content"] == "[response interrupted]"
+        assert assistant["content"] == _INTERRUPTED_PLACEHOLDER
         # The durable list is not mutated (wire-copy-only design).
         assert rows[1]["content"] == ""
 
@@ -769,11 +819,256 @@ if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
 
 
+class ReadTimeout(Exception):
+    """A transport read timeout — the silent kill that ends a gpt-6.1-sol attempt.
+
+    The class name matters: the classifier routes ``ReadTimeout`` by error type
+    (``agent/error_classifier.py::_TRANSPORT_ERROR_TYPES``), as ``FailoverReason.timeout``.
+    """
+
+
+def _rows_carrying(payload, text):
+    """How many rows of one assembled request carry *text* (a second steer row would make 2)."""
+    return sum(
+        1 for m in payload
+        if isinstance(m, dict) and text in str(m.get("content") or "")
+    )
+
+
+class TestSteerRidesSameProviderResend:
+    """LS-3830 U2: a ``/steer`` typed while a model request is in flight rides the retry
+    loop's same-provider resend instead of waiting for the next iteration boundary (up to
+    the whole retry ladder). The retry loop injects it after the newest tool row through
+    ``_inject_steer_after_newest_tool_result`` and re-assembles the request."""
+
+    STEER_TEXT = "STEER_RIDES_RESEND_7c1e"
+
+    def _agent(self, *, fallback_chain=None):
+        from unittest.mock import MagicMock, patch
+
+        from run_agent import AIAgent
+
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": _STEER_SURVIVAL_TOOL,
+                "description": "probe tool for the steer-survival regression test",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[tool_schema]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+                provider="zai",
+                model="glm-5.1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=fallback_chain,
+            )
+        agent.client = MagicMock()
+        # U1's live value, pinned here so the test does not read ~/.hermes/config.yaml.
+        agent._api_max_retries = 2
+        agent._disable_streaming = True
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        return agent
+
+    def _run(self, agent, model_call):
+        from unittest.mock import MagicMock, patch
+
+        fallback_client = MagicMock()
+        fallback_client.api_key = "test-key-1234567890"
+        fallback_client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+        fallback_client._custom_headers = None
+        fallback_client.default_headers = None
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=model_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "glm-4.7"),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        ):
+            return agent.run_conversation("start something")
+
+    @staticmethod
+    def _tool_call(call_id):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=call_id, type="function",
+            function=SimpleNamespace(name=_STEER_SURVIVAL_TOOL, arguments="{}"),
+        )
+
+    def test_steer_rides_resend_after_timeout(self):
+        from tests.agent.test_run_agent import _mock_response
+
+        agent = self._agent()
+        payloads = []
+
+        def model_call(api_kwargs):
+            payloads.append([dict(m) for m in api_kwargs["messages"]])
+            if len(payloads) == 1:
+                return _mock_response(
+                    content=None, finish_reason="tool_calls",
+                    tool_calls=[self._tool_call("call_1")],
+                )
+            if len(payloads) == 2:
+                # Typed while this request is in flight, then the call dies silently.
+                assert agent.steer(self.STEER_TEXT) is True
+                raise ReadTimeout("read timed out")
+            return _mock_response(content="resumed")
+
+        result = self._run(agent, model_call)
+
+        assert result["completed"] is True
+        assert len(payloads) == 3
+        assert _rows_carrying(payloads[0], self.STEER_TEXT) == 0
+        assert _rows_carrying(payloads[1], self.STEER_TEXT) == 0
+        resent = payloads[2]
+        assert resent[-1]["role"] == "user"
+        assert STEER_MARKER_OPEN in resent[-1]["content"]
+        assert self.STEER_TEXT in resent[-1]["content"]
+        assert _rows_carrying(resent, self.STEER_TEXT) == 1
+        assert agent._pending_steer is None
+
+    def test_steer_survives_second_kill_into_fallback(self):
+        from tests.agent.test_run_agent import _mock_response
+
+        agent = self._agent(fallback_chain=[{
+            "provider": "zai",
+            "model": "glm-4.7",
+            "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+        }])
+        # Force the second kill past primary-transport recovery so it activates the fallback.
+        agent._try_recover_primary_transport = lambda *a, **k: False
+        payloads = []
+        calls = []
+
+        def model_call(api_kwargs):
+            payloads.append([dict(m) for m in api_kwargs["messages"]])
+            calls.append((agent.provider, agent.model))
+            attempt = len(payloads)
+            if attempt == 1:
+                return _mock_response(
+                    content=None, finish_reason="tool_calls",
+                    tool_calls=[self._tool_call("call_1")],
+                )
+            if attempt in (2, 3):
+                if attempt == 2:
+                    assert agent.steer(self.STEER_TEXT) is True
+                raise ReadTimeout("read timed out")
+            return _mock_response(content="recovered on fallback")
+
+        result = self._run(agent, model_call)
+
+        assert result["completed"] is True
+        assert calls == [("zai", "glm-5.1")] * 3 + [("zai", "glm-4.7")]
+        assert _rows_carrying(payloads[0], self.STEER_TEXT) == 0
+        assert _rows_carrying(payloads[1], self.STEER_TEXT) == 0
+        # Exactly once on the resend, exactly once on the second killed request, exactly
+        # once after the fallback — never duplicated by the fallback's own steer drain.
+        for idx in (2, 3):
+            assert _rows_carrying(payloads[idx], self.STEER_TEXT) == 1, f"payload {idx}"
+        assert _rows_carrying(result["messages"], self.STEER_TEXT) == 1
+        assert agent._pending_steer is None
+
+    def test_steer_not_redelivered_after_tool_batch(self):
+        from tests.agent.test_run_agent import _mock_response
+
+        agent = self._agent()
+        payloads = []
+
+        def model_call(api_kwargs):
+            payloads.append([dict(m) for m in api_kwargs["messages"]])
+            attempt = len(payloads)
+            if attempt == 1:
+                return _mock_response(
+                    content=None, finish_reason="tool_calls",
+                    tool_calls=[self._tool_call("call_1")],
+                )
+            if attempt == 2:
+                assert agent.steer(self.STEER_TEXT) is True
+                raise ReadTimeout("read timed out")
+            if attempt == 3:
+                # A later tool batch: its own steer drain must find the slot empty.
+                return _mock_response(
+                    content=None, finish_reason="tool_calls",
+                    tool_calls=[self._tool_call("call_2")],
+                )
+            return _mock_response(content="done")
+
+        result = self._run(agent, model_call)
+
+        assert result["completed"] is True
+        assert len(payloads) == 4
+        assert _rows_carrying(payloads[2], self.STEER_TEXT) == 1
+        assert _rows_carrying(payloads[3], self.STEER_TEXT) == 1, (
+            "the tool-batch drain re-delivered a steer the resend already carried"
+        )
+        assert _rows_carrying(result["messages"], self.STEER_TEXT) == 1
+        assert agent._pending_steer is None
+
+    def test_steer_without_tool_row_is_requeued(self):
+        from unittest.mock import ANY, patch
+
+        from agent import conversation_loop
+
+        from tests.agent.test_run_agent import _mock_response
+
+        agent = self._agent()
+        payloads = []
+
+        def model_call(api_kwargs):
+            payloads.append([dict(m) for m in api_kwargs["messages"]])
+            if len(payloads) == 1:
+                assert agent.steer(self.STEER_TEXT) is True
+                raise ReadTimeout("read timed out")
+            # No tool row exists: the injector re-queues instead of forcing a row.
+            assert agent._pending_steer == self.STEER_TEXT
+            return _mock_response(content="done")
+
+        real_inject = conversation_loop._inject_steer_after_newest_tool_result
+        with patch.object(
+            conversation_loop, "_inject_steer_after_newest_tool_result", wraps=real_inject,
+        ) as inject:
+            result = self._run(agent, model_call)
+
+        assert result["completed"] is True
+        assert len(payloads) == 2
+        # The retry loop asked the shared primitive (never a hand-rolled row) …
+        inject.assert_called_once_with(agent, ANY, self.STEER_TEXT)
+        # … and it re-queued: no forced row anywhere.
+        assert all(_rows_carrying(p, self.STEER_TEXT) == 0 for p in payloads)
+        # The restored slot is handed back at turn end as the next user turn.
+        assert result.get("pending_steer") == self.STEER_TEXT
+        assert agent._pending_steer is None
+
+
+
 class TestLegacyHiddenPlaceholderWireSubstitution:
     """Projection-side half of #88955: rows persisted BEFORE the writer-side
     ``api_content`` stamp are ``content=""`` + ``display_kind="hidden"`` with
     no sidecar. The send-time projection must give the WIRE copy the neutral
-    ``[response interrupted]`` payload so legacy sessions converge instead of
+    interrupt-placeholder payload so legacy sessions converge instead of
     re-healing forever — while the durable row stays hidden and empty."""
 
     def _loop_agent(self):
@@ -861,7 +1156,7 @@ class TestLegacyHiddenPlaceholderWireSubstitution:
         wire_assistants = [m for m in wire if m.get("role") == "assistant"]
         legacy = wire_assistants[0]
         # Substituted on the wire by the projection (not the sanitizer):
-        assert legacy["content"] == "[response interrupted]"
+        assert legacy["content"] == _INTERRUPTED_PLACEHOLDER
         assert "display_kind" not in legacy
         # #81841: never the interrupt scaffold.
         assert "[This response was interrupted" not in legacy["content"]
@@ -871,7 +1166,7 @@ class TestLegacyHiddenPlaceholderWireSubstitution:
         assert "api_content" not in history[1]
 
     def test_hidden_row_with_tool_calls_or_text_is_not_touched(self):
-        from agent.conversation_loop import _clone_message_for_send  # noqa: F401
+        from agent.conversation_loop import _clone_message_for_send
         from unittest.mock import patch
 
         from tests.agent.test_run_agent import _mock_response

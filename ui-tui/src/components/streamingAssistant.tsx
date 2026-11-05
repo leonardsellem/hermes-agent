@@ -9,6 +9,7 @@ import { appendToolShelfMessage } from '../lib/liveProgress.js'
 import type { ActiveTool, DetailsMode, Msg, SectionVisibility } from '../types.js'
 
 import { MessageLine } from './messageLine.js'
+import { ToolTrail } from './thinking.js'
 import { TodoPanel } from './todoPanel.js'
 
 const groupedSegments = (segments: Msg[]): Msg[] =>
@@ -35,9 +36,10 @@ export const StreamingAssistant = memo(function StreamingAssistant({
   const streamPendingTools = useTurnSelector(state => state.streamPendingTools)
   const streaming = useTurnSelector(state => state.streaming)
   const activeTools = useTurnSelector(state => state.tools)
+  const activity = useTurnSelector(state => state.activity)
   const showStreamingArea = Boolean(streaming)
 
-  if (!progress.showProgressArea && !showStreamingArea && !activeTools.length) {
+  if (!progress.showProgressArea && !showStreamingArea && !activeTools.length && !activity.length) {
     return null
   }
 
@@ -97,6 +99,10 @@ export const StreamingAssistant = memo(function StreamingAssistant({
 
         return node
       })}
+      {activity.length > 0 && (
+        <ToolTrail activity={activity} commandOverride={detailsModeCommandOverride}
+          detailsMode={detailsMode} sections={sections} t={ui.theme} />
+      )}
     </>
   )
 })
