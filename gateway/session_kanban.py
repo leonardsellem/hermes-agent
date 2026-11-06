@@ -295,10 +295,35 @@ def record_start_failure(frame, exc):
     if context is None:
         return
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
+    flags = credential_failure_flags(exc)
+    code, start_failure = turn_exit_code(None, kanban_worker=True, **flags), None
+    # An exhausted provider pool is a provider wall, not a task failure: reuse the existing 75
+    # and name the class. Flags stay authoritative — an AuthError anywhere in the chain keeps its
+    # own code (a re-login wrapped over a pool error is still 78).
+    pool = _pool_exhausted_provider(exc) if flags == {} else None
+    if pool is not None:
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+        model = (frame.get('policy') or {}).get('model')
+        code = KANBAN_RATE_LIMIT_EXIT_CODE
+        start_failure = {'phase': 'construction', 'class': 'provider_pool_exhausted',
+                         'provider': str(pool.provider or '')[:80],
+                         'requested_model': str(model or '')[:120]}
+    _record_worker_result(context, code, '', start_failure=start_failure)
 
 
-def _record_worker_result(context, code, last_output):
+def _pool_exhausted_provider(exc):
+    """The ``ProviderCredentialsExhaustedError`` in ``exc``'s cause chain, if any (cycle-safe)."""
+    from agent.auxiliary_unavailable import ProviderCredentialsExhaustedError
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ProviderCredentialsExhaustedError):
+            return exc
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def _record_worker_result(context, code, last_output, start_failure=None):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -307,9 +332,11 @@ def _record_worker_result(context, code, last_output):
         if _bound_worker_matches(conn, context):
             # Closing a run clears its claim/PID and replaces metadata; keep the
             # result in the immutable attempt event stream instead.
-            kb._append_event(conn, context['task_id'], 'worker_result',
-                {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+            payload = {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                       'last_output': last_output}
+            if start_failure is not None:
+                payload['start_failure'] = start_failure
+            kb._append_event(conn, context['task_id'], 'worker_result', payload, run_id=context['run_id'])
 
 
 def _bound_worker_matches(conn, context):

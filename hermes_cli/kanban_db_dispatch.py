@@ -1173,7 +1173,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import managed_run_result, owner_reclaim_blocked
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1191,9 +1191,17 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
 
             pid = int(row["worker_pid"])
-            # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
-            exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            # A managed run's authority-recorded result (its bound interpreter's, under this claim).
+            result = managed_run_result(conn, row["id"], pid, row["claim_lock"])
+            dead = _classify_dead_worker(pid, row["claim_lock"], result.get("exit_code"),
+                                         task_id=row["id"], board=board)
+            failure = result.get("start_failure")
+            if dead.rate_limited and isinstance(failure, dict):
+                # The quota wall's own text is generic; name the construction wall the worker hit.
+                dead.error_text += (
+                    " — agent construction failed before any turn: provider_pool_exhausted "
+                    f"(provider={failure.get('provider', '')}, requested model={failure.get('requested_model', '')})")
+                dead.event_payload["start_failure"] = failure
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
