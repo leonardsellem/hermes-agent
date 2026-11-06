@@ -86,3 +86,58 @@ async def test_an_owner_that_stalls_after_admitting_fails_the_wait_within_the_lo
             # The outer 5 s guard only stops an unbounded wait from hanging the test.
             await real_wait_for(kanban_worker_client._submit_claim(client, params, str(tmp_path / 'kanban.db')), 5)
     assert budgets == [budget] and [r['method'] for r in owner.sent] == ['kanban.run']
+
+
+class _UnknownOwner:
+    """Admits nothing: ``kanban.run`` answers an ``unknown`` receipt immediately."""
+
+    def __init__(self):
+        self.inbox, self.sent = asyncio.Queue(), []
+
+    async def send(self, raw):
+        req = json.loads(raw)
+        self.sent.append(req)
+        if req['method'] == 'kanban.run':
+            await self.inbox.put(json.dumps({'id': req['id'], 'result': {
+                'session_id': 's1', 'receipt': {'status': 'unknown', 'admission_id': 'a1'}}}))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self.inbox.get()
+
+
+async def _unknown_refusal(monkeypatch, tmp_path, result):
+    from gateway import session_kanban
+    from hermes_cli.gateway_client import GatewayClientError
+    monkeypatch.setattr(session_kanban, 'worker_result', lambda db, params: result)
+    owner = _UnknownOwner()
+    params = {'board': 'b', 'task_id': 't1', 'run_id': 1, 'claim_lock': 'lock'}
+    async with GatewayClient(owner) as client:
+        with pytest.raises(GatewayClientError) as refused:
+            await kanban_worker_client._submit_claim(client, params, str(tmp_path / 'kanban.db'))
+    assert [r['method'] for r in owner.sent] == ['kanban.run']
+    return str(refused.value)
+
+
+@pytest.mark.asyncio
+async def test_unknown_receipt_names_pool_exhaustion_from_bound_result(monkeypatch, tmp_path):
+    """An unknown receipt whose bound result is a 75 with ``start_failure`` names the cause; the
+    authority barrier itself is unchanged (still ``unknown``, one submission)."""
+    result = {'exit_code': 75, 'start_failure': {'phase': 'construction', 'class': 'provider_pool_exhausted',
+              'provider': 'openai-codex', 'requested_model': 'gpt-test'}}
+    message = await _unknown_refusal(monkeypatch, tmp_path, result)
+    assert 'provider_pool_exhausted' in message and 'gpt-test' in message and 'openai-codex' in message
+
+
+@pytest.mark.asyncio
+async def test_unknown_receipt_without_result_keeps_generic_refusal(monkeypatch, tmp_path):
+    message = await _unknown_refusal(monkeypatch, tmp_path, {})
+    assert message == 'Kanban execution unknown; retained by owner'
+
+
+@pytest.mark.asyncio
+async def test_unknown_receipt_with_plain_failure_keeps_generic_refusal(monkeypatch, tmp_path):
+    message = await _unknown_refusal(monkeypatch, tmp_path, {'exit_code': 1})
+    assert message == 'Kanban execution unknown; retained by owner'

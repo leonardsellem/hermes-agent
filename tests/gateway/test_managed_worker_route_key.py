@@ -9,6 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# Same worktree-under-the-real-home bootstrap reason as tests/gateway/test_kanban_result_exit.py:
+# the agent entry point must be imported before the real-home I/O guard is installed.
+from gateway import session_managed_worker  # noqa: F401
 from tests.gateway.test_managed_turn_contract import assignment
 
 BASE_URL = 'https://api.minimax.io/anthropic'
@@ -151,6 +154,32 @@ def test_keyless_worker_credential_failure_keeps_the_kanban_start_exit(tmp_path,
         _execute(frame, monkeypatch, built=built)
     assert built == {}
     assert session_kanban.worker_exit_code(path, context) == expected
+
+
+def test_keyless_worker_pool_exhausted_books_75(tmp_path, monkeypatch):
+    """The real worker construction path classifies an exhausted provider pool as the 75 quota wall
+    and records the requested model from the frozen policy, without building an agent."""
+    from agent.auxiliary_unavailable import ProviderCredentialsExhaustedError
+    from gateway import session_kanban
+    from hermes_cli import kanban_db as kb
+    from tests.gateway.test_kanban_result_exit import _bound_claim
+    path, context = _bound_claim(tmp_path / 'kanban', monkeypatch)
+    frame = _minimax_frame(tmp_path, monkeypatch)
+    frame = {**frame, 'policy': {**frame['policy'], 'kanban_json': json.dumps(context),
+                                 'model': 'asked-model'}}
+
+    def resolve(**kwargs):
+        raise ProviderCredentialsExhaustedError('pool exhausted', provider='custom:minimax')
+    monkeypatch.setattr('hermes_cli.runtime_provider_custom._resolve_named_custom_runtime', resolve)
+    monkeypatch.setattr(session_kanban, 'bind_worker_context', lambda frame: None)
+    built = {}
+    with pytest.raises(ProviderCredentialsExhaustedError):
+        _execute(frame, monkeypatch, built=built)
+    assert built == {}
+    result = session_kanban.worker_result(path, context)
+    assert result['exit_code'] == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert result['start_failure'] == {'phase': 'construction', 'class': 'provider_pool_exhausted',
+                                       'provider': 'custom:minimax', 'requested_model': 'asked-model'}
 
 
 FALLBACK = {'provider': 'openrouter', 'model': 'fallback-model'}

@@ -75,9 +75,18 @@ async def _submit_claim(client, params, board_db):
     while receipt['status'] not in {'terminal', 'unknown'}:
         await asyncio.sleep(.2)
         receipt = await client.rpc('prompt.receipt', session_id=sid, admission_id=receipt['admission_id'])
-    if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
     from gateway.session_kanban import worker_result
+    if receipt['status'] == 'unknown':
+        # The authority keeps the attempt unknown either way; the bound result may still name a
+        # construction wall the worker hit before any turn, which the receipt cannot carry.
+        result = worker_result(board_db, params)
+        failure = result.get('start_failure')
+        if result.get('exit_code') == 75 and isinstance(failure, dict):
+            raise GatewayClientError(
+                'Kanban execution unknown; retained by owner — agent construction failed before any turn: '
+                f"provider_pool_exhausted (provider={failure.get('provider', '')}, "
+                f"requested model={failure.get('requested_model', '')})")
+        raise GatewayClientError('Kanban execution unknown; retained by owner')
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
