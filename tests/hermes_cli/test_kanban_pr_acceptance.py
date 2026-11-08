@@ -20,11 +20,18 @@ def github(tmp_path, monkeypatch):
             state["requests"].append(self.path)
             sha = state["head"]
             if self.path == "/graphql":
+                protection = None if state.get("no_protection") else {"requiredStatusChecks": [
+                    {"context": "required", "app": {"databaseId": 1}}]}
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "baseRef": {"branchProtectionRule": protection}}}}}
             elif "/rules/branches/" in self.path:
+                if state.get("rules_status"):
+                    code, message = state["rules_status"]
+                    self.send_response(code)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"message": message}).encode())
+                    return
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
@@ -33,15 +40,18 @@ def github(tmp_path, monkeypatch):
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
                 runs = [] if state.get("missing") else [run]
-                value = [{"total_count": 100 + len(runs), "check_runs": [
-                    {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
-                    for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
+                value = ([{"total_count": 0, "check_runs": []}] if state.get("empty") else
+                         [{"total_count": 100 + len(runs), "check_runs": [
+                             {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
+                             for i in range(100)]},
+                          {"total_count": 100 + len(runs), "check_runs": runs}])
                 if state.get("race"):
                     state["race"]()
                 if state.get("head_change"):
                     state["head"] = "b" * 40
             elif "/statuses" in self.path:
-                value = [[]]
+                value = [[{"id": 7, "context": "legacy", "state": state["legacy"],
+                           "target_url": "https://ci.example/7"}]] if state.get("legacy") else [[]]
             elif "/pulls/" in self.path:
                 value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
             else:
@@ -60,9 +70,15 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport json,sys,urllib.error,urllib.request\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n"
+                  "    body=e.read().decode()\n    print(body)\n"
+                  "    try:\n        msg=json.loads(body).get('message','')\n"
+                  "    except Exception:\n        msg=''\n"
+                  "    sys.stderr.write('gh: '+msg+' (HTTP '+str(e.code)+')\\n')\n"
+                  "    sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -230,3 +246,52 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+@pytest.mark.platforms("linux")
+def test_plan_limited_rules_fall_back_to_the_head_checks(github):
+    """A free-plan private repo answers the rules API with a 403 plan message: read
+    no rules, then accept only when every check on the exact head is green."""
+    with connect() as conn:
+        def latest(tid):
+            row = conn.execute("SELECT payload FROM task_events WHERE task_id=? "
+                               "AND kind='pr_acceptance' ORDER BY id DESC", (tid,)).fetchone()
+            assert row, "acceptance receipt missing"
+            return json.loads(row[0])
+
+        def attempt(title):
+            tid = kb.create_task(conn, title=title, completion_contract="acme/repo")
+            ok = kb.complete_task(conn, tid, result="done",
+                                  metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            return ok, latest(tid)
+
+        plan_403 = (403, "Upgrade to GitHub Pro or make this repository public to enable this feature.")
+        github.update(no_protection=True, rules_status=plan_403, conclusion="success", legacy="success")
+        ok, receipt = attempt("plan-limited")
+        assert ok and receipt["classification"] == "success"
+        assert "403" in receipt["rules"] and receipt["fallback"] and receipt["required"] == []
+
+        for outcome in ("failure", "pending"):
+            github.update(conclusion=outcome)
+            ok, receipt = attempt(outcome)
+            assert not ok and receipt["classification"] == outcome
+
+        github.update(conclusion="success", legacy="failure")
+        ok, receipt = attempt("legacy-failure")
+        assert not ok and receipt["classification"] == "failure"
+
+        github.pop("legacy")
+        github.update(empty=True)
+        ok, receipt = attempt("no-checks")
+        assert not ok and receipt["classification"] == "missing"
+
+        github.pop("empty")
+        github.update(rules_status=(403, "Resource not accessible by integration"))
+        ok, receipt = attempt("other-403")
+        assert not ok and receipt["classification"] == "auth"
+        assert "403" in receipt["detail"]
+
+        github.update(rules_status=(401, "Requires authentication"))
+        ok, receipt = attempt("no-login-401")
+        assert not ok and receipt["classification"] == "auth"
+        assert "401" in receipt["detail"]

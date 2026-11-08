@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_PLAN_LIMIT_403 = "Upgrade to GitHub Pro or make this repository public to enable this feature."
 
 
 def validate_contract(value: str | None) -> str:
@@ -29,7 +30,7 @@ def validate_contract(value: str | None) -> str:
 
 
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
-         profile_home: str | None = None):
+         profile_home: str | None = None, allow_plan_403: bool = False):
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
     if query is not None:
         command += ["-f", "query=" + query]
@@ -45,6 +46,8 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # code + endpoint, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
         if denied:
+            if allow_plan_403 and denied[1] == "403" and _PLAN_LIMIT_403 in (exc.stdout or "") + (exc.stderr or ""):
+                raise _GateRulesUnreadable(f"HTTP 403 plan limit on {endpoint.split('?')[0]}") from None
             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
@@ -59,6 +62,11 @@ class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+
+class _GateRulesUnreadable(RuntimeError):
+    """The branch-rules API answered 403 for a plan limit (a private repository
+    without GitHub Pro): the rules are unreadable, not the login refused."""
 
 
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
@@ -133,8 +141,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        rules_unreadable = False
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home, allow_plan_403=True)
+        except _GateRulesUnreadable:
+            # A plan-limited private repo cannot expose its rules: absence of a
+            # required-check rule proves nothing, so the head's own checks decide.
+            rules, rules_unreadable = [], True
+            receipt["rules"] = "unreadable: HTTP 403 plan limit for private repositories"
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -142,8 +157,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
-            return receipt
+            if protection or not rules_unreadable:
+                receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+                return receipt
+            receipt["fallback"] = "rules unreadable; every check on the exact head must be success/neutral/skipped"
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
         runs = [run for page in pages for run in page["check_runs"]]
@@ -152,21 +169,40 @@ def collect_acceptance(contract: str, published_pr: str | None,
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         outcomes = []
-        for context, app_id in sorted(required, key=str):
-            matching = [r for r in runs if r["name"] == context and
-                        (app_id in (None, -1) or r["app"]["id"] == app_id)]
-            # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
-            legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
-            selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
-            if not selected:
-                outcomes.append("missing")
-                receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
-            for check in selected:
+        if required:
+            for context, app_id in sorted(required, key=str):
+                matching = [r for r in runs if r["name"] == context and
+                            (app_id in (None, -1) or r["app"]["id"] == app_id)]
+                # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
+                legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
+                selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
+                if not selected:
+                    outcomes.append("missing")
+                    receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
+                for check in selected:
+                    is_run = "conclusion" in check
+                    outcome = check.get("conclusion") if is_run else check["state"]
+                    classification = _classify(check, sha, outcome, is_run)
+                    outcomes.append(classification)
+                    receipt["checks"].append({"name": context, "id": check["id"],
+                        "url": check.get("html_url") or check.get("target_url"),
+                        "head_sha": check.get("head_sha", check.get("sha")),
+                        "classification": classification, "conclusion": outcome})
+        else:
+            # Fallback: latest legacy status per context (older rebuilds never decide)
+            # plus every check run on the exact head.
+            latest = {}
+            for status in statuses:
+                if status["context"] not in latest or status["id"] > latest[status["context"]]["id"]:
+                    latest[status["context"]] = status
+            for check in runs + list(latest.values()):
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
+                if classification == "infra" and outcome in {"neutral", "skipped"}:
+                    classification = "success"
                 outcomes.append(classification)
-                receipt["checks"].append({"name": context, "id": check["id"],
+                receipt["checks"].append({"name": check.get("name") or check["context"], "id": check["id"],
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
                     "classification": classification, "conclusion": outcome})
