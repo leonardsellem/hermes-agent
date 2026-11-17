@@ -21,7 +21,8 @@ def github(tmp_path, monkeypatch):
             sha = state["head"]
             if self.path == "/graphql":
                 protection = None if state.get("no_protection") else {"requiredStatusChecks": [
-                    {"context": "required", "app": {"databaseId": 1}}]}
+                    {"context": context, "app": {"databaseId": state.get("required_app", 1)}}
+                    for context in state.get("required_contexts", ["required"])]}
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
                     "baseRef": {"branchProtectionRule": protection}}}}}
@@ -39,7 +40,10 @@ def github(tmp_path, monkeypatch):
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
-                runs = [] if state.get("missing") else [run]
+                runs = [] if state.get("missing") else [
+                    {**run, "id": 42 + i, "name": context,
+                     "conclusion": state.get("conclusions", {}).get(context, state["conclusion"])}
+                    for i, context in enumerate(state.get("required_contexts", ["required"]))]
                 value = ([{"total_count": 0, "check_runs": []}] if state.get("empty") else
                          [{"total_count": 100 + len(runs), "check_runs": [
                              {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
@@ -98,12 +102,19 @@ def test_pr_completion_requires_current_required_evidence(github):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
             ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
-            assert ok is (conclusion == "success")
+            accepted = conclusion in {"success", "skipped", "neutral"}
+            assert ok is accepted
             task = kb.get_task(conn, tid)
             assert (task.status == "done") is ok
             receipts = [json.loads(r[0]) for r in conn.execute(
                 "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))]
             assert receipts and receipts[-1]["head_sha"] == "a" * 40
+            if accepted and conclusion != "success":
+                # A by-design skip is accepted but never erased from the receipt.
+                assert receipts[-1]["skipped_required"] == [{"name": "required", "conclusion": conclusion}]
+                assert "skipped by their workflow" in receipts[-1]["detail"]
+            else:
+                assert "skipped_required" not in receipts[-1]
             if not ok:
                 assert task.status in {"running", "ready", "blocked", "review"}
                 assert "retry" in receipts[-1]["recovery"]
@@ -115,6 +126,31 @@ def test_pr_completion_requires_current_required_evidence(github):
             assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert kb.get_task(conn, tid).status != "done"
             github.pop(fault)
+        # A required context skipped by its own workflow does not hide the other contexts.
+        github.update(conclusion="success", head="a" * 40,
+                      required_contexts=["green", "skipped-one"],
+                      conclusions={"green": "success", "skipped-one": "skipped"})
+        tid = kb.create_task(conn, title="skipped beside green", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))][-1]
+        assert receipt["skipped_required"] == [{"name": "skipped-one", "conclusion": "skipped"}]
+        assert {c["name"] for c in receipt["checks"] if c["classification"] == "success"} == {"green"}
+        # A skipped run on another sha is stale, never a skip to accept.
+        github.update(conclusion="skipped", head="a" * 40, stale=True,
+                      required_contexts=["required"], conclusions={})
+        tid = kb.create_task(conn, title="stale-skip", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))][-1]
+        assert receipt["classification"] == "stale" and "skipped_required" not in receipt
+        # A run from another app cannot satisfy an app-pinned required context.
+        github.update(conclusion="success", head="a" * 40, stale=False, required_app=2)
+        tid = kb.create_task(conn, title="wrong-app", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))][-1]
+        assert receipt["classification"] == "missing" and receipt["checks"][0]["classification"] == "missing"
         # Omission and a sibling repository cannot downgrade the stored declaration.
         tid = kb.create_task(conn, title="publish", completion_contract="acme/repo")
         assert not kb.complete_task(conn, tid, summary="local green")
