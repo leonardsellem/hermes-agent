@@ -234,14 +234,18 @@ def _verdict(receipt: dict, outcomes: list[str], required: set) -> None:
     """Set the verdict, and keep a required context its own workflow skipped visible.
 
     A path/event filter may legitimately skip a required context; that is a recorded
-    outcome, not an outage. Any other non-success still blocks.
+    outcome, not an outage. Any other non-success still blocks. A required check
+    skipped because a ``needs:`` predecessor failed is accepted the same way,
+    mirroring GitHub's own branch-protection pass set (documented residual risk).
     """
     blocking = [x for x in outcomes if x not in {"success", "skipped", "neutral"}]
     receipt["classification"] = (blocking or ["success"])[0] if outcomes else "missing"
     skipped = ([{"name": c["name"], "conclusion": c["conclusion"]}
                 for c in receipt["checks"] if c["classification"] in {"skipped", "neutral"}]
                if required else [])
-    if skipped:
+    # A blocking sibling owns the detail line: a skip must never be the reason an
+    # operator is shown for a receipt that failed.
+    if skipped and not blocking:
         receipt["skipped_required"] = skipped
         receipt["detail"] = ("Required context(s) skipped by their workflow: "
                              + ", ".join(f"{s['name']} ({s['conclusion']})" for s in skipped)
