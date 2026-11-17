@@ -136,6 +136,35 @@ def test_pr_completion_requires_current_required_evidence(github):
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))][-1]
         assert receipt["skipped_required"] == [{"name": "skipped-one", "conclusion": "skipped"}]
         assert {c["name"] for c in receipt["checks"] if c["classification"] == "success"} == {"green"}
+        # A skip beside a blocking sibling never softens the verdict, and the operator
+        # message names the blocking class instead of the skip.
+        for blocking in ("failure", "pending"):
+            github.update(conclusion="success", head="a" * 40, stale=False,
+                          required_contexts=["skipped-one", "blocking-one"],
+                          conclusions={"skipped-one": "skipped", "blocking-one": blocking})
+            tid = kb.create_task(conn, title=f"skipped beside {blocking}", completion_contract="acme/repo")
+            assert not kb.complete_task(conn, tid, result="done",
+                                        metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            receipt = [json.loads(r[0]) for r in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))][-1]
+            assert receipt["classification"] == blocking
+            assert "skipped_required" not in receipt and "detail" not in receipt
+            assert {c["name"]: c["classification"] for c in receipt["checks"]} == {
+                "skipped-one": "skipped", "blocking-one": blocking}
+            task = kb.get_task(conn, tid)
+            assert task and "skipped by their workflow" not in (task.last_failure_error or "")
+        # A neutral required context is an accepted non-blocking outcome beside a success.
+        github.update(conclusion="success", head="a" * 40, stale=False,
+                      required_contexts=["green", "neutral-one"],
+                      conclusions={"green": "success", "neutral-one": "neutral"})
+        tid = kb.create_task(conn, title="neutral beside green", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,))][-1]
+        assert receipt["classification"] == "success"
+        assert receipt["skipped_required"] == [{"name": "neutral-one", "conclusion": "neutral"}]
+        assert "neutral-one (neutral)" in receipt["detail"]
         # A skipped run on another sha is stale, never a skip to accept.
         github.update(conclusion="skipped", head="a" * 40, stale=True,
                       required_contexts=["required"], conclusions={})
@@ -423,6 +452,13 @@ def test_plan_limited_rules_fall_back_to_the_head_checks(github):
         ok, receipt = attempt("plan-limited")
         assert ok and receipt["classification"] == "success"
         assert "403" in receipt["rules"] and receipt["fallback"] and receipt["required"] == []
+
+        # On the fallback path every head check decides: a skipped check is its own
+        # per-check outcome, not an infrastructure failure.
+        github.update(conclusion="skipped")
+        ok, receipt = attempt("plan-limited-skip")
+        assert ok
+        assert [c["classification"] for c in receipt["checks"] if c["name"] == "required"] == ["skipped"]
 
         for outcome in ("failure", "pending"):
             github.update(conclusion=outcome)
