@@ -199,57 +199,13 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("Incomplete check-run pagination")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
-        outcomes = []
-        if required:
-            for context, app_id in sorted(required, key=str):
-                matching = [r for r in runs if r["name"] == context and
-                            (app_id in (None, -1) or r["app"]["id"] == app_id)]
-                # Status APIs expose an actor, not the originating integration ID.
-                observed = [s for s in statuses if s["context"] == context]
-                latest = max(observed, key=lambda s: s["id"]) if observed else None
-                selected = matching + ([latest] if latest and app_id in (None, -1) else [])
-                if not selected:
-                    if latest and app_id is not None and app_id != -1:
-                        outcomes.append(_record_unverifiable_status(receipt, latest, sha, app_id))
-                    else:
-                        outcomes.append("missing")
-                        receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
-                for check in selected:
-                    is_run = "conclusion" in check
-                    outcome = check.get("conclusion") if is_run else check["state"]
-                    classification = _classify(check, sha, outcome, is_run)
-                    if classification == "infra" and outcome in {"neutral", "skipped"}:
-                        classification = "success"
-                    outcomes.append(classification)
-                    receipt["checks"].append({"name": context, "id": check["id"],
-                        "url": check.get("html_url") or check.get("target_url"),
-                        "head_sha": check.get("head_sha", check.get("sha")),
-                        "classification": classification, "conclusion": outcome})
-        else:
-            # Fallback: latest legacy status per context (older rebuilds never decide)
-            # plus every check run on the exact head.
-            latest = {}
-            for status in statuses:
-                if status["context"] not in latest or status["id"] > latest[status["context"]]["id"]:
-                    latest[status["context"]] = status
-            for check in runs + list(latest.values()):
-                is_run = "conclusion" in check
-                outcome = check.get("conclusion") if is_run else check["state"]
-                classification = _classify(check, sha, outcome, is_run)
-                if classification == "infra" and outcome in {"neutral", "skipped"}:
-                    classification = "success"
-                outcomes.append(classification)
-                receipt["checks"].append({"name": check.get("name") or check["context"], "id": check["id"],
-                    "url": check.get("html_url") or check.get("target_url"),
-                    "head_sha": check.get("head_sha", check.get("sha")),
-                    "classification": classification, "conclusion": outcome})
+        outcomes = _check_outcomes(receipt, runs, statuses, required, sha)
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
-        receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
-        receipt["ok"] = receipt["classification"] == "success"
+        _verdict(receipt, outcomes, required)
         return receipt
     except _GateAuthError as exc:
         login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
@@ -283,6 +239,71 @@ def _record_unverifiable_status(receipt: dict, status: dict, sha: str, app_id: i
     return classification
 
 
+def _check_outcomes(receipt: dict, runs: list[dict], statuses: list[dict],
+                    required: set, sha: str) -> list[str]:
+    """Classify each required context (or every head check when rules are unreadable)."""
+    outcomes = []
+    if required:
+        for context, app_id in sorted(required, key=str):
+            matching = [r for r in runs if r["name"] == context and
+                        (app_id in (None, -1) or r["app"]["id"] == app_id)]
+            # Status APIs expose an actor, not the originating integration ID.
+            observed = [s for s in statuses if s["context"] == context]
+            latest = max(observed, key=lambda s: s["id"]) if observed else None
+            selected = matching + ([latest] if latest and app_id in (None, -1) else [])
+            if not selected:
+                if latest and app_id is not None and app_id != -1:
+                    outcomes.append(_record_unverifiable_status(receipt, latest, sha, app_id))
+                else:
+                    outcomes.append("missing")
+                    receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
+            for check in selected:
+                is_run = "conclusion" in check
+                outcome = check.get("conclusion") if is_run else check["state"]
+                classification = _classify(check, sha, outcome, is_run)
+                outcomes.append(classification)
+                receipt["checks"].append({"name": context, "id": check["id"],
+                    "url": check.get("html_url") or check.get("target_url"),
+                    "head_sha": check.get("head_sha", check.get("sha")),
+                    "classification": classification, "conclusion": outcome})
+    else:
+        # Fallback: latest legacy status per context (older rebuilds never decide)
+        # plus every check run on the exact head.
+        latest = {}
+        for status in statuses:
+            if status["context"] not in latest or status["id"] > latest[status["context"]]["id"]:
+                latest[status["context"]] = status
+        for check in runs + list(latest.values()):
+            is_run = "conclusion" in check
+            outcome = check.get("conclusion") if is_run else check["state"]
+            classification = _classify(check, sha, outcome, is_run)
+            outcomes.append(classification)
+            receipt["checks"].append({"name": check.get("name") or check["context"], "id": check["id"],
+                "url": check.get("html_url") or check.get("target_url"),
+                "head_sha": check.get("head_sha", check.get("sha")),
+                "classification": classification, "conclusion": outcome})
+    return outcomes
+
+
+def _verdict(receipt: dict, outcomes: list[str], required: set) -> None:
+    """Set the verdict, and keep a required context its own workflow skipped visible.
+
+    A path/event filter may legitimately skip a required context; that is a recorded
+    outcome, not an outage. Any other non-success still blocks.
+    """
+    blocking = [x for x in outcomes if x not in {"success", "skipped", "neutral"}]
+    receipt["classification"] = (blocking or ["success"])[0] if outcomes else "missing"
+    skipped = ([{"name": c["name"], "conclusion": c["conclusion"]}
+                for c in receipt["checks"] if c["classification"] in {"skipped", "neutral"}]
+               if required else [])
+    if skipped:
+        receipt["skipped_required"] = skipped
+        receipt["detail"] = ("Required context(s) skipped by their workflow: "
+                             + ", ".join(f"{s['name']} ({s['conclusion']})" for s in skipped)
+                             + "; not an infrastructure failure.")
+    receipt["ok"] = bool(outcomes) and not blocking
+
+
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
     if check.get("head_sha", check.get("sha")) != sha:
         return "stale"
@@ -290,4 +311,5 @@ def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
         return "pending"
     if outcome is None:
         return "infra"
-    return {"success": "success", "failure": "failure", "error": "infra", "pending": "pending"}.get(outcome, "infra")
+    return {"success": "success", "failure": "failure", "error": "infra", "pending": "pending",
+            "skipped": "skipped", "neutral": "neutral"}.get(outcome, "infra")
