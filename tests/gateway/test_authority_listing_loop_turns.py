@@ -70,6 +70,10 @@ async def test_a_live_listing_reads_the_store_off_the_loop_in_one_read(owner, mo
     rows = await owner.listing(method, **params)
     assert len(rows) == (200 if method == 'session.list' else SESSION_COUNT)
     assert reads['loop'] == 0, reads
+    if params.get('picker'):
+        # The picker lists stored rows too: one worker read per batch, never one per session.
+        assert 0 < reads['worker'] < SESSION_COUNT // 10, reads
+        return
     # One read connection for the whole pass, never one per session or per chunk of the registry.
     assert reads['worker'] == 1, reads
 
