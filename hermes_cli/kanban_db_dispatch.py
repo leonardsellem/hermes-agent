@@ -1640,14 +1640,19 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    #    Only a comment written inside one of THIS card's run windows is its own
+    #    duplicate signal: a PR left on the card by another profile's run must not
+    #    block it forever (#LS-4168). A card with no run of its own keeps the old
+    #    fail-closed hold. Exception: a handoff AFTER the newest attributable PR
+    #    comment (operator reassign, reviewer changes_requested, review reopen)
+    #    names the profile that must now work on THAT PR — a closer or the
+    #    implementer finishing it, not a duplicate implementation (#111910). A
+    #    crash/reclaim is not a handoff, so the worker that opened the PR is still
+    #    not re-spawned against it.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+                                          cols=", body, created_at AS raw_stamp", unreadable=now)  # duplicate-PR risk: fail closed
+                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")
+                and _pr_comment_from_own_run(conn, task_id, c["raw_stamp"])]
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
@@ -1691,6 +1696,29 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
         return False
     to = data.get("assignee")
     return bool(to) and "from" in data and data["from"] != to
+
+
+def _pr_comment_from_own_run(conn: sqlite3.Connection, task_id: str, stamp: Any) -> bool:
+    """Whether a PR comment can be attributed to a run of THIS card: its stamp
+    falls inside one of the card's ``task_runs`` windows. A card with no run of
+    its own keeps the previous hold — nothing attributes the comment — and an
+    unreadable stamp or window boundary holds too: the guard never lifts on
+    missing evidence, and only an attributable comment is a duplicate signal."""
+    written = _kb._to_epoch(stamp)
+    if written is None:
+        return True
+    windows = list(conn.execute(
+        "SELECT started_at, ended_at FROM task_runs WHERE task_id = ?", (task_id,)))
+    if not windows:
+        return True
+    for started_at, ended_at in windows:
+        start = _kb._to_epoch(started_at)
+        if start is None:
+            return True
+        end = _kb._to_epoch(ended_at)
+        if written >= start and (end is None or written <= end):
+            return True
+    return False
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
