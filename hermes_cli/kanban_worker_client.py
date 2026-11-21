@@ -125,10 +125,24 @@ async def _await_receipt(client, params, board_db, claim):
     return receipt
 
 
+def _owner_lost_note(board_db, params):
+    """The owner's own record of why it retained THIS attempt (its run and claim), or ``""``."""
+    import json
+    import sqlite3
+    from contextlib import closing
+    with closing(sqlite3.connect(Path(board_db).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND task_id=? AND kind='worker_lost' ORDER BY id DESC LIMIT 1",
+            (params['run_id'], params['task_id'])).fetchone()
+    lost = json.loads(row[0]) if row else {}
+    # A note from another claim says nothing about this attempt.
+    return str(lost.get('reason') or '') if lost.get('claim_lock') == params['claim_lock'] else ''
+
+
 def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
     if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
+        note = _owner_lost_note(board_db, params)
+        raise GatewayClientError(f'managed worker lost: {note}' if note else 'managed worker lost: no worker_lost note')
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.

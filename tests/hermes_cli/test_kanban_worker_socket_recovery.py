@@ -256,3 +256,36 @@ async def test_a_refused_ticket_reads_like_a_refusing_owner(monkeypatch, _worker
         async with gateway_client.connect_gateway():
             pass
     assert (raised.value.state, raised.value.reason_code) == ("inaccessible", "invalid_control_response")
+
+
+def _retained_claim(tmp_path, monkeypatch, claim_lock=None):
+    """A claimed card at the fixture's own run, with the owner's ``worker_lost`` note on that run."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from tests.gateway.test_kanban_result_exit import _bound_claim
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    with connect_closing(path) as conn, kb.write_txn(conn):
+        kb._append_event(conn, context["task_id"], "worker_lost",
+                         {"reason": "managed_worker_failed", "run_id": context["run_id"],
+                          "claim_lock": claim_lock or context["claim_lock"], "pid": 1, "bound": True},
+                         run_id=context["run_id"])
+    return path, context
+
+
+def test_unknown_receipt_names_the_recorded_worker_loss(tmp_path, monkeypatch):
+    """A retained attempt names the cause the owner recorded for this run and claim, instead of the
+    opaque refusal that booked five crashes as one (LS-4312)."""
+    path, context = _retained_claim(tmp_path, monkeypatch)
+
+    with pytest.raises(gateway_client.GatewayClientError) as raised:
+        kanban_worker_client._exit_code({"status": "unknown"}, context, str(path))
+    assert "managed worker lost: managed_worker_failed" in str(raised.value)
+    assert "Kanban execution unknown" not in str(raised.value)
+
+
+def test_unknown_receipt_without_this_attempt_a_note_says_so(tmp_path, monkeypatch):
+    # The note belongs to another claim: it says nothing about this attempt, so it is not quoted.
+    path, context = _retained_claim(tmp_path, monkeypatch, claim_lock="another-host:claim")
+
+    with pytest.raises(gateway_client.GatewayClientError, match="managed worker lost: no worker_lost note"):
+        kanban_worker_client._exit_code({"status": "unknown"}, context, str(path))

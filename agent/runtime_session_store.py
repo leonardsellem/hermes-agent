@@ -77,6 +77,14 @@ def call_off_event_loop(fn, *args, **kwargs):
         return pool.submit(context.run, fn, *args, **kwargs).result()
 
 
+# The owner may spend its whole 60 s ``worker.persist`` lock deadline
+# (``SessionDB._TRANSCRIPT_WRITE_PATIENCE_S``) and then run the write callback plus one post-commit
+# maintenance pass before it replies; a shorter receipt expires while the owner is still allowed to
+# finish, and the failed save kills the turn (LS-4312: 20 s against 60 s). 60 + a 30 s margin.
+# Not imported from ``hermes_state``: the worker never loads the owner's store.
+WORKER_PERSIST_RECEIPT_S = 90.0
+
+
 class _OwnerLink:
     """One owner WebSocket and the only thread that reads it. Events the owner broadcasts to every
     transport are discarded as they arrive, idle or not: left queued, websockets' bounded receive
@@ -194,7 +202,7 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(WORKER_PERSIST_RECEIPT_S)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
