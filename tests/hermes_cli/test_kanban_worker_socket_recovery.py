@@ -289,3 +289,11 @@ def test_unknown_receipt_without_this_attempt_a_note_says_so(tmp_path, monkeypat
 
     with pytest.raises(gateway_client.GatewayClientError, match="managed worker lost: no worker_lost note"):
         kanban_worker_client._exit_code({"status": "unknown"}, context, str(path))
+
+
+def test_unreadable_board_costs_the_note_not_the_refusal(tmp_path):
+    # A contended or missing board must not replace the refusal with an uncaught sqlite error:
+    # _submit only wraps (KeyError, ValueError, OSError).
+    with pytest.raises(gateway_client.GatewayClientError, match="managed worker lost: no worker_lost note"):
+        kanban_worker_client._exit_code(
+            {"status": "unknown"}, {"task_id": "t", "run_id": 1, "claim_lock": "c"}, str(tmp_path / "missing.db"))

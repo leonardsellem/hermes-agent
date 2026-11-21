@@ -130,10 +130,14 @@ def _owner_lost_note(board_db, params):
     import json
     import sqlite3
     from contextlib import closing
-    with closing(sqlite3.connect(Path(board_db).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
-        row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND task_id=? AND kind='worker_lost' ORDER BY id DESC LIMIT 1",
-            (params['run_id'], params['task_id'])).fetchone()
-    lost = json.loads(row[0]) if row else {}
+    # The refusal must still read as a refusal: a contended or unreadable board costs the note only.
+    try:
+        with closing(sqlite3.connect(Path(board_db).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+            row = conn.execute("SELECT payload FROM task_events WHERE run_id=? AND task_id=? AND kind='worker_lost' ORDER BY id DESC LIMIT 1",
+                (params['run_id'], params['task_id'])).fetchone()
+        lost = json.loads(row[0]) if row else {}
+    except (sqlite3.Error, TypeError, ValueError, OSError):
+        return ''
     # A note from another claim says nothing about this attempt.
     return str(lost.get('reason') or '') if lost.get('claim_lock') == params['claim_lock'] else ''
 
