@@ -39,8 +39,10 @@ def _interactive(authority, session_id):
     """The session's frozen launch surface names a local one: ``source`` itself, or the real surface
     a shared-gateway row keeps in ``created_source`` over ``source='local'`` (a TUI row is
     ``local`` + ``tui``).
-    Callers hold the stream lock: one plain read per session, cached (``get_session`` flushes token
-    counts, a write). Under WAL it takes the lock-free reader pool, as ``_pending_rows`` does there."""
+    Callers hold the stream lock: ``list_row`` is one plain WAL read, cached; a ``source='local'``
+    row takes a second ``sessions.get`` read whose ``flush_for_read`` passes ``timeout=0.0`` on a
+    running event loop (never waits under the stream lock; may read token totals stale by queued
+    deltas)."""
     sources = authority.launch_sources
     if session_id not in sources:
         sessions = authority_persistence(authority).sessions
