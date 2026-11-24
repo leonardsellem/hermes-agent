@@ -181,14 +181,14 @@ def test_persistence_receipt_outlives_owner_write_patience(monkeypatch, tmp_path
     """The owner may spend its whole 60 s ``worker.persist`` lock deadline and then run the write
     callback and one post-commit maintenance pass before it replies; a receipt at or below that
     deadline (20 s, or the superseded 45 s) kills the owner's reader first (LS-4312)."""
-    from hermes_state import SessionDB
+    from persistence.sqlite._holder import StoreHolder
     from agent.runtime_session_store import WORKER_PERSIST_RECEIPT_S
     rpc, link = _rpc_over_a_fake_link(monkeypatch, tmp_path)
 
     rpc('worker.persist', execution_id='w', payload={})
 
-    assert link.timeouts and link.timeouts[0] > SessionDB._TRANSCRIPT_WRITE_PATIENCE_S
-    assert WORKER_PERSIST_RECEIPT_S - SessionDB._TRANSCRIPT_WRITE_PATIENCE_S >= 15
+    assert link.timeouts and link.timeouts[0] > StoreHolder._TRANSCRIPT_WRITE_PATIENCE_S
+    assert WORKER_PERSIST_RECEIPT_S - StoreHolder._TRANSCRIPT_WRITE_PATIENCE_S >= 15
 
 
 def test_persistence_receipt_uses_the_budget(monkeypatch, tmp_path):

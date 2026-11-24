@@ -43,13 +43,17 @@ def _interactive(authority, session_id):
     counts, a write). Under WAL it takes the lock-free reader pool, as ``_pending_rows`` does there."""
     sources = authority.launch_sources
     if session_id not in sources:
-        found = authority_persistence(authority).sessions.list_row(session_id)
+        sessions = authority_persistence(authority).sessions
+        found = sessions.list_row(session_id)
         if found is None:
             return False
-        sources[session_id] = (
-            found.source in _INTERACTIVE_SOURCES
-            or (found.source == 'local' and found.created_source in _INTERACTIVE_SOURCES)
-        )
+        if found.source in _INTERACTIVE_SOURCES:
+            sources[session_id] = True
+        elif found.source == 'local':
+            full = sessions.get(session_id)
+            sources[session_id] = full is not None and full.created_source in _INTERACTIVE_SOURCES
+        else:
+            sources[session_id] = False
     verdict = sources[session_id]
     return verdict is True or verdict in _INTERACTIVE_SOURCES
 
