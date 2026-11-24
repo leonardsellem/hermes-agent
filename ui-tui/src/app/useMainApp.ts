@@ -16,7 +16,6 @@ import type {
   ConfigSetResponse,
   SessionCloseResponse,
   SharedControlRespondResponse,
-  SubagentListResponse,
   TerminalResizeResponse
 } from '@hermes/shared/gateway-types'
 import { JSON_RPC_METHOD_NOT_FOUND, type ServerRequest } from '@hermes/shared/json-rpc-channel'
@@ -55,7 +54,7 @@ import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type SlashHandler, type StateSetter, type TranscriptRow, type UiState } from './interfaces.js'
-import { applyLiveSessionRoster, requestLiveSessions } from './liveSessions.js'
+import { applyLiveSessionRoster } from './liveSessions.js'
 import { applyControlSnapshot } from './loopStatus.js'
 import { $overlayState, capturePromptResponseGuard, hasSensitivePrompt, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'

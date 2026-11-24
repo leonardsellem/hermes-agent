@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { isServerQueued } from '../app/pendingBubbles.js'
+import { isServerQueued, type PendingRow } from '../app/pendingBubbles.js'
 import { readSteerOutcome, STEER_QUEUED_CONTROL } from '../app/submissionCore.js'
 import { captureDestination, type SubmissionDestination } from '../app/submissionDestination.js'
 import { $uiState, getUiState, patchUiState } from '../app/uiStore.js'
@@ -17,9 +17,6 @@ import {
   removePendingInput,
   savePendingInput
 } from '../lib/pendingInputs.js'
-import type { SessionInfo } from '../types.js'
-
-type PendingRow = NonNullable<SessionInfo['pending_submissions']>[number]
 
 // An admission in transfer lists as `started` with the steering mark: it is no longer a queued row,
 // but it is not the client's to drain either (LS-3826 U3).
