@@ -24,6 +24,7 @@ from .._backend import SQLiteStore, register_repository, translated
 from ..conversation._store.core import _session_row_dict
 from ..conversation._store.local import owned_lineage_ids
 from ..conversation._store.sessions import _own_profile_name
+from ..conversation._store.sql_common import _id_chunks, _placeholders
 from ..conversation.sessions import session_record
 from ._local_lineage import hand_off_conversations, moved_receipts
 from ._routes import (
@@ -111,20 +112,49 @@ class SQLiteRoutingRepository:
             )
 
     def replace_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str = "") -> set[str]:
+        """Replace the routing index for *routing_scope* as a DELTA (keys absent from *entries* are
+        removed); other scopes untouched. Returns the keys skipped as retired routes, which the
+        sessions.json mirror must leave out too.
+
+        Only added, changed and removed keys are written (``_id_chunks``-sized batches) — a
+        whole-scope DELETE + re-insert held the writer mutex for the entire ~20 000-row index
+        (LS-4187: 88 of 235 refusals, p90 29.8 s). The fence is evaluated for EVERY submitted
+        entry inside the same transaction, so an unchanged route whose session was retired is
+        dropped and returned too, exactly as the whole-scope rewrite did.
+        """
         now = time.time()
-        rows = [{'scope': routing_scope, 'key': k, **route_retired_params(k, v, now)}
-                for k, v in entries.items() if k and v]
+        wanted = {k: v for k, v in entries.items() if k and v}
 
         def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (routing_scope,))
-            if rows:
-                conn.executemany(
-                    "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "SELECT :scope, :key, :entry, :now WHERE NOT " + ROUTE_RETIRED_SQL,
-                    rows)
-            kept = {r[0] for r in conn.execute(
-                "SELECT session_key FROM gateway_routing WHERE scope = ?", (routing_scope,))}
-            return {row['key'] for row in rows} - kept
+            stored = {row["session_key"]: row["entry_json"] for row in conn.execute(
+                "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (routing_scope,))}
+            rejected: set[str] = set()
+            to_upsert: list[tuple[str, str]] = []
+            for batch in _id_chunks(list(wanted.items())):
+                for key, entry in batch:
+                    if conn.execute("SELECT " + ROUTE_RETIRED_SQL,
+                                    route_retired_params(key, entry, now)).fetchone()[0]:
+                        rejected.add(key)
+                    elif stored.get(key) != entry:
+                        to_upsert.append((key, entry))
+            to_delete = [key for key in stored if key not in wanted or key in rejected]
+            for batch in _id_chunks(to_delete):
+                conn.execute(f"DELETE FROM gateway_routing WHERE scope = ? AND session_key IN ({_placeholders(batch)})",
+                             (routing_scope, *batch))
+            for batch in _id_chunks(to_upsert):
+                values = ",".join("(?,?,?,?)" for _ in batch)
+                params = [value for key, entry in batch for value in (routing_scope, key, entry, now)]
+                conn.execute("INSERT OR REPLACE INTO gateway_routing "
+                             "(scope, session_key, entry_json, updated_at) VALUES " + values, params)
+            # The rejected set is what is missing after the write, selected on the submitted
+            # keys only: no full-scope re-select.
+            kept: set[str] = set()
+            for batch in _id_chunks(list(wanted)):
+                kept |= {row[0] for row in conn.execute(
+                    f"SELECT session_key FROM gateway_routing WHERE scope = ? AND session_key IN ({_placeholders(batch)})",
+                    (routing_scope, *batch))}
+            return set(wanted) - kept
+
         with translated():
             holder = self._store.holder()
             return holder._execute_write(_do)

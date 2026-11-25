@@ -8,8 +8,10 @@ lost attempt:
   A1  a killed worker under a live claim is booked ``crashed`` within one tick;
   A2  an elapsed ``claim_expires`` never leaves the card ``running`` after one tick, even
       with no heartbeat and no pid (and even behind a settled owner receipt);
-  A3  every such booking increments ``consecutive_failures``, so ``kanban.failure_limit``
-      covers this outcome class and the card blocks at the limit.
+  A3  a ``managed_worker_failed`` loss is NOT charged to the card for its first three
+      trailing consecutive losses: the booking carries ``infrastructure: true``, no
+      ``gave_up`` is written and the card returns to its source status. From the fourth
+      consecutive loss on every loss is charged and the normal budget applies.
 """
 
 from __future__ import annotations
@@ -111,6 +113,46 @@ class _Board:
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, ?, ?, ?)", (tid, run, kind, json.dumps(payload), ts))
 
+    def running_again(self, tid: str, *, worker_lost: str = "managed_worker_failed",
+                      started: int | None = None) -> int:
+        """Open a NEW run for an existing ``ready`` card and seed its ``worker_lost``.
+
+        ``running()`` inserts the task row and cannot be called twice for one id; the bounded
+        infrastructure case needs one fresh attempt per tick on the same card.
+        """
+        started = int(time.time()) - 60 if started is None else int(started)
+        pid = _absent_pid(base=3_930_000)
+        lock = f"{HOST}:{_absent_pid(base=3_910_000)}"
+        run_id = int(self.conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'fan', 'running', ?, ?, ?, ?)",
+            (tid, lock, started + 900, pid, started),
+        ).lastrowid)
+        self.conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = ?, claim_expires = ?, worker_pid = ?, "
+            "worker_started_at = ?, last_heartbeat_at = ?, current_run_id = ?, started_at = ? "
+            "WHERE id = ?",
+            (lock, started + 900, pid, FINGERPRINT, started + 30, run_id, started, tid),
+        )
+        self.event(tid, run_id, "claimed", {"lock": lock, "expires": started + 900}, started)
+        self.event(tid, run_id, "spawned", {"pid": pid, "started_at": FINGERPRINT}, started)
+        self.event(tid, run_id, "worker_lost",
+                   {"reason": worker_lost, "claim_lock": lock, "run_id": run_id,
+                    "pid": pid, "bound": True}, started + 24)
+        self.conn.commit()
+        return run_id
+
+    def seed_crashed_runs(self, tid: str, count: int, *, infrastructure: bool = True) -> None:
+        """Prior closed ``crashed`` runs; the trailing streak the infrastructure bound counts."""
+        for n in range(count):
+            ended = NOW - 3_600 + n
+            self.conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, metadata) "
+                "VALUES (?, 'fan', 'crashed', ?, ?, 'crashed', ?)",
+                (tid, ended - 120, ended, json.dumps({"infrastructure": infrastructure} if infrastructure else {})),
+            )
+        self.conn.commit()
+
     # --- reading ---------------------------------------------------------------------
     def state(self, tid: str) -> dict:
         return dict(self.conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
@@ -135,34 +177,33 @@ def test_a_killed_managed_worker_is_disposed_of_within_one_tick(board):
     assert (row["claim_lock"], row["worker_pid"], row["current_run_id"]) == (None, None, None)
     assert run["outcome"] == "crashed"
     assert "managed worker lost: managed_worker_failed" in run["error"]
-    assert json.loads(run["metadata"])["attempt_note"] == "managed worker lost: managed_worker_failed"
-    assert row["consecutive_failures"] == 1               # A3: the breaker sees it
+    metadata = json.loads(run["metadata"])
+    assert metadata["attempt_note"] == "managed worker lost: managed_worker_failed"
+    assert metadata["infrastructure"] is True            # A3: host fault, not the card's
+    assert row["consecutive_failures"] == 0
     assert row["last_failure_error"]
+    crashed = [json.loads(r["payload"]) for r in board.conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = 't_killed' AND kind = 'crashed'")]
+    assert crashed and crashed[-1]["infrastructure"] is True
 
 
-def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
-    """The breaker covers this class: one loss short of the limit, the next loss blocks.
+def test_a_managed_worker_loss_does_not_charge_the_failure_limit(board):
+    """One unseeded loss books 0 and writes no ``gave_up``; the card stays retryable.
 
-    ``_account_crashes`` books a plain crash against ``DEFAULT_FAILURE_LIMIT`` (the sweep
-    resolves the threshold there rather than against the dispatcher's ``failure_limit``),
-    so the card is seeded one failure short of that limit instead of pinning a threshold
-    this path never reads.
+    The blocked-at-limit transition for this class is the fifth loss of the bounded case.
     """
     board.running("t_killed", claim_expires_in=900, heartbeat_age=30,
                   worker_lost="managed_worker_failed")
-    board.conn.execute("UPDATE tasks SET consecutive_failures = ? WHERE id = 't_killed'",
-                       (kbd.DEFAULT_FAILURE_LIMIT - 1,))
-    board.conn.commit()
     board.tick()
     row = board.state("t_killed")
-    assert row["status"] == "blocked"
-    assert row["consecutive_failures"] == kbd.DEFAULT_FAILURE_LIMIT
+    assert row["status"] == "ready"
+    assert row["consecutive_failures"] == 0
     kinds = [r["kind"] for r in board.conn.execute(
         "SELECT kind FROM task_events WHERE task_id = 't_killed' ORDER BY id")]
-    assert "gave_up" in kinds
+    assert "gave_up" not in kinds
 
 
-def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
+def test_a_lost_worker_that_exited_cleanly_is_not_a_protocol_violation(board):
     """rc=0 after a lost managed execution is not a protocol violation: the turn never ran."""
     run_id = board.running("t_clean", claim_expires_in=900, heartbeat_age=30,
                            worker_lost="managed_worker_failed")
@@ -180,13 +221,115 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
     assert "I fixed the protocol violation" in run["error"]  # the worker's own output is kept
     assert run["error"].index("[managed worker lost") < run["error"].index("Worker's last output")
     assert "without kanban_complete" not in run["error"]
-    assert board.state("t_clean")["consecutive_failures"] == 1
-    # Not a protocol violation as well: one loss is charged to one budget.
+    assert board.state("t_clean")["consecutive_failures"] == 0
+    # Not a protocol violation as well: one loss is booked as one infrastructure requeue.
     assert "protocol_violation" not in json.loads(run["metadata"] or "{}")
     kinds = [r[0] for r in board.conn.execute(
         "SELECT kind FROM task_events WHERE task_id='t_clean' AND run_id=?", (run_id,))]
     assert "protocol_violation" not in kinds and "crashed" in kinds
     assert kbd._protocol_violation_streak(board.conn, "t_clean") == 0
+
+
+def test_a_systemic_wave_of_managed_worker_losses_keeps_the_cards_retryable(board):
+    """Three identical losses in one tick: each card is retryable, none is parked.
+
+    The wave's fourth card is already at its three-loss bound, so it is charged inside the
+    same wave and parks at ``failure_limit = 1`` — R4's systemic arm.
+    """
+    cards = ["t_wave_a", "t_wave_b", "t_wave_c"]
+    runs = {}
+    for tid in cards:
+        runs[tid] = board.running(tid, claim_expires_in=900, heartbeat_age=30,
+                                  worker_lost="managed_worker_failed")
+        log = kb.worker_log_path(tid)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"{tid} last words\n", encoding="utf-8")
+    board.running("t_wave_d", claim_expires_in=900, heartbeat_age=30,
+                  worker_lost="managed_worker_failed")
+    log = kb.worker_log_path("t_wave_d")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("t_wave_d last words\n", encoding="utf-8")
+    board.seed_crashed_runs("t_wave_d", 3)
+
+    board.tick(failure_limit=2)
+
+    for tid in cards:
+        row, run = board.state(tid), board.run(runs[tid])
+        assert row["status"] == "ready", tid
+        assert row["consecutive_failures"] == 0, tid
+        kinds = [r[0] for r in board.conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND run_id = ?", (tid, runs[tid]))]
+        assert "gave_up" not in kinds, tid
+        metadata = json.loads(run["metadata"])
+        assert metadata["infrastructure"] is True
+        assert metadata["worker_output"] == f"{tid} last words"
+        crashed = [json.loads(r["payload"]) for r in board.conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'crashed'", (tid,))]
+        assert crashed[-1]["infrastructure"] is True
+        assert crashed[-1]["worker_output"] == f"{tid} last words"
+
+    charged = board.state("t_wave_d")
+    assert charged["status"] == "blocked"
+    assert charged["consecutive_failures"] == 1
+    gave = [json.loads(r["payload"]) for r in board.conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = 't_wave_d' AND kind = 'gave_up'")]
+    assert gave and gave[-1]["failures"] == 1
+    assert gave[-1]["effective_limit"] == 1 and gave[-1]["sticky"] is True
+
+
+def test_a_fourth_infrastructure_loss_charges_the_budget(board):
+    """Three free requeues, then two charged failures: the fourth books 1, the fifth parks."""
+    board.running("t_bound", claim_expires_in=900, heartbeat_age=30,
+                  worker_lost="managed_worker_failed")
+    board.seed_crashed_runs("t_bound", 3)
+
+    board.tick(failure_limit=2)
+    row = board.state("t_bound")
+    assert row["status"] == "ready"
+    assert row["consecutive_failures"] == 1
+    kinds = [r["kind"] for r in board.conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = 't_bound' ORDER BY id")]
+    assert "gave_up" not in kinds
+    fourth = [json.loads(r["metadata"] or "{}") for r in board.conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = 't_bound' AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1")]
+    assert fourth[0].get("infrastructure") is not True
+
+    board.running_again("t_bound")
+    board.tick(failure_limit=2)
+    row = board.state("t_bound")
+    assert row["status"] == "blocked"
+    assert row["consecutive_failures"] == kbd.DEFAULT_FAILURE_LIMIT
+    kinds = [r["kind"] for r in board.conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = 't_bound' ORDER BY id")]
+    assert "gave_up" in kinds
+
+
+def test_an_infrastructure_requeue_is_spaced_by_the_cooldown(board):
+    board.running("t_spaced", claim_expires_in=900, heartbeat_age=30,
+                  worker_lost="managed_worker_failed")
+    board.tick()
+    assert board.state("t_spaced")["status"] == "ready"
+    assert kbd.check_respawn_guard(board.conn, "t_spaced") == "infrastructure_cooldown"
+
+
+@pytest.mark.parametrize("prior", [0, 1, 2])
+def test_the_first_three_trailing_losses_are_requeued_unbounded(board, prior):
+    """The bound counts the card's trailing losses: 0, 1 and 2 prior crashes stay infrastructure."""
+    board.running("t_free", claim_expires_in=900, heartbeat_age=30,
+                  worker_lost="managed_worker_failed")
+    board.seed_crashed_runs("t_free", prior)
+    board.tick()
+    row = board.state("t_free")
+    assert row["status"] == "ready"
+    assert row["consecutive_failures"] == 0
+    latest = board.conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = 't_free' AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1").fetchone()
+    assert json.loads(latest["metadata"])["infrastructure"] is True
+    kinds = [r["kind"] for r in board.conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = 't_free' ORDER BY id")]
+    assert "gave_up" not in kinds
 
 
 def test_a_crash_whose_output_quotes_protocol_violation_is_not_one(board):
@@ -288,7 +431,8 @@ async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_
     run = board.run(run_id)
     assert run["outcome"] == "crashed"
     assert "managed worker lost: managed_worker_failed" in run["error"]
-    assert board.state("t_owner")["consecutive_failures"] == 1
+    assert board.state("t_owner")["consecutive_failures"] == 0
+    assert json.loads(run["metadata"])["infrastructure"] is True
 
 
 def test_a_loss_recorded_against_a_superseded_run_is_dropped(board):

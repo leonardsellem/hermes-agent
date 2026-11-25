@@ -513,15 +513,18 @@ class _SessionDB:
         deleted_ids: "Optional[list]" = None, **filters: "Any",
     ) -> "int":
         from persistence.housekeeping.maintenance import PruneCriteria
-        from session_retention import after_sessions_removed
+        from session_retention import after_removed_chunk, collect_retired_media
+
+        def _committed(ids):
+            if deleted_ids is not None:
+                deleted_ids.extend(ids)
+            after_removed_chunk(self._store.scope.profile_dir, ids, reason="prune", sessions_dir=sessions_dir)
 
         outcome = self._store.maintenance.prune_sessions(
             older_than_days, source, criteria=PruneCriteria(**filters),
-            exclude_active_write_guards=exclude_active_write_guards, media_root=_media_root())
-        after_sessions_removed(self._store, self._store.scope.profile_dir, outcome.deleted_ids, reason="prune",
-                               sessions_dir=sessions_dir)
-        if deleted_ids is not None:
-            deleted_ids.extend(outcome.deleted_ids)
+            exclude_active_write_guards=exclude_active_write_guards, media_root=_media_root(),
+            on_committed=_committed)
+        collect_retired_media(self._store, self._store.scope.profile_dir)
         return outcome.count
 
     # -- state_meta ------------------------------------------------------------------------
