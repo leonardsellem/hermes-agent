@@ -89,6 +89,76 @@ def test_a_retired_entry_is_still_skipped(store, media_root):
     assert "k0" not in store.routing.load_routing_entries(routing_scope=SCOPE)
 
 
+def test_delta_write_uses_bounded_sql_statements_for_large_index(store):
+    """A 20k-row routing save with 1 change must not issue O(N) per-row SELECTs inside the write lock."""
+    _seed(store, SEED)
+    entries = {f"k{i}": _entry(i) for i in range(SEED)}
+    entries["k0"] = _entry(0, value=1)
+    statements = []
+    store.holder()._conn.set_trace_callback(statements.append)
+    try:
+        skipped = store.routing.replace_routing_entries(entries, routing_scope=SCOPE)
+    finally:
+        store.holder()._conn.set_trace_callback(None)
+    assert skipped == set()
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+    assert len(selects) <= 5, f"expected O(1) SELECTs for {SEED} rows, got {len(selects)}"
+
+
+def test_range_scan_fence_matches_all_namespace_and_expiry_rules(store, media_root):
+    import time
+    from persistence.authority.vocabulary import RETRY_HORIZON_S
+    from persistence.sqlite.conversation._store.retirement import RETIRED_PREFIX
+    from persistence.sqlite.gateway._routes import ROUTE_FENCE_PREFIX
+
+    now = time.time()
+    def _setup(conn):
+        # 1. own-scoped retirement marker: fences main, does NOT fence secondary 'jude'
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                     (RETIRED_PREFIX + "s_own", json.dumps({"retired_at": now, "own": True})))
+        # 2. unscoped legacy retirement marker: fences both main and secondary
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                     (RETIRED_PREFIX + "s_unscoped", json.dumps({"retired_at": now})))
+        # 3. active secondary fence: fences jude
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                     (ROUTE_FENCE_PREFIX + "jude:s_fenced", json.dumps({"retired_at": now})))
+        # 4. expired sweep fence: must NOT fence
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                     (ROUTE_FENCE_PREFIX + "jude:s_expired",
+                      json.dumps({"retired_at": now - RETRY_HORIZON_S - 60, "expires": True})))
+        # 5. main fence where session DOES exist in sessions table: must NOT fence
+        conn.execute("INSERT INTO sessions(id, source, started_at) VALUES('s_live_main', 'local', ?)", (now,))
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                     (ROUTE_FENCE_PREFIX + "main:s_live_main", json.dumps({"retired_at": now})))
+        # 6. main fence where session does NOT exist in sessions table: MUST fence
+        conn.execute("INSERT INTO state_meta(key,value) VALUES(?,?)",
+                     (ROUTE_FENCE_PREFIX + "main:s_gone_main", json.dumps({"retired_at": now})))
+
+    store.holder()._execute_write(_setup)
+    entries = {
+        "agent:main:local:dm:1": json.dumps({"session_id": "s_own"}),
+        "agent:jude:local:dm:1": json.dumps({"session_id": "s_own"}),
+        "agent:jude:local:dm:2": json.dumps({"session_id": "s_unscoped"}),
+        "agent:jude:local:dm:3": json.dumps({"session_id": "s_fenced"}),
+        "agent:jude:local:dm:4": json.dumps({"session_id": "s_expired"}),
+        "agent:main:local:dm:5": json.dumps({"session_id": "s_live_main"}),
+        "agent:main:local:dm:6": json.dumps({"session_id": "s_gone_main"}),
+    }
+    skipped = store.routing.replace_routing_entries(entries, routing_scope=SCOPE)
+    assert skipped == {
+        "agent:main:local:dm:1",
+        "agent:jude:local:dm:2",
+        "agent:jude:local:dm:3",
+        "agent:main:local:dm:6",
+    }, skipped
+    stored = set(store.routing.load_routing_entries(routing_scope=SCOPE))
+    assert stored == {
+        "agent:jude:local:dm:1",
+        "agent:jude:local:dm:4",
+        "agent:main:local:dm:5",
+    }, stored
+
+
 def _chunks(items, size):
     for start in range(0, len(items), size):
         yield items[start:start + size]

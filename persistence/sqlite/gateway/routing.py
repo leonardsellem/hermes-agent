@@ -15,22 +15,24 @@ from typing import Any, Optional
 from persistence.sqlite._state.errors import StateDbReplacedError
 from persistence import JsonValue, SessionId, SessionRowMissing
 from persistence.core.artifacts import SessionArtifacts
+from persistence.authority.vocabulary import RETRY_HORIZON_S
 from persistence.gateway.routing import (
     ORPHAN_ADOPTION_MAX_GAP_S, NeverActivePrune, NeverActiveSession, OrphanReport, RecoveredPeerSession,
-    TopicAlreadyLinked, TopicBinding, normalize_topic_profile_name,
+    TopicAlreadyLinked, TopicBinding, normalize_topic_profile_name, route_namespace,
 )
 
 from .._backend import SQLiteStore, register_repository, translated
 from ..conversation._store.core import _session_row_dict
 from ..conversation._store.local import owned_lineage_ids
+from ..conversation._store.retirement import RETIRED_PREFIX
 from ..conversation._store.sessions import _own_profile_name
 from ..conversation._store.sql_common import _id_chunks, _placeholders
 from ..conversation.sessions import session_record
 from ._local_lineage import hand_off_conversations, moved_receipts
 from ._routes import (
     _COMPRESSION_LINEAGE_CTE, _ORPHAN_CONTIGUITY_DONORS_SQL, _ORPHAN_LINEAGE_DONOR_SQL, _ORPHANS_SQL,
-    _PEER_BY_KEY_SQL, _PEER_BY_TUPLE_SQL, ROUTE_RETIRED_SQL, apply_telegram_topic_migration, fence_shared_routes,
-    route_retired_params,
+    _PEER_BY_KEY_SQL, _PEER_BY_TUPLE_SQL, ROUTE_FENCE_PREFIX, ROUTE_RETIRED_SQL, apply_telegram_topic_migration,
+    fence_shared_routes, route_retired_params,
 )
 
 __all__ = ["SQLiteRoutingRepository"]
@@ -111,6 +113,63 @@ class SQLiteRoutingRepository:
                  **route_retired_params(session_key, entry_json, time.time())},
             )
 
+    @staticmethod
+    def _prefix_upper_bound(prefix: str) -> str:
+        return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+    @classmethod
+    def _load_retirement_fences(
+        cls, conn: sqlite3.Connection, now: float,
+    ) -> tuple[dict[str, bool], set[tuple[str, str]]]:
+        """Load active session-retirement markers and shared route fences via two PK range scans.
+
+        Returns ``(retired_own_scoped, active_fences)`` matching ``ROUTE_RETIRED_SQL`` semantics:
+        - ``retired_own_scoped[sid]`` is True when the marker carries a non-null ``own`` field
+          (fences ``ns == 'main'`` only), False when unscoped or malformed JSON (fences all namespaces).
+        - ``active_fences`` holds ``(ns, sid)`` pairs whose fence has not aged past ``RETRY_HORIZON_S``.
+        """
+        cutoff = now - RETRY_HORIZON_S
+        retired_own_scoped: dict[str, bool] = {}
+        for key, raw in conn.execute(
+            "SELECT key, value FROM state_meta WHERE key >= ? AND key < ?",
+            (RETIRED_PREFIX, cls._prefix_upper_bound(RETIRED_PREFIX)),
+        ):
+            sid = key[len(RETIRED_PREFIX):]
+            own_scoped = False
+            if isinstance(raw, (str, bytes)):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict) and parsed.get("own") is not None:
+                        own_scoped = True
+                except (ValueError, TypeError, RecursionError):
+                    own_scoped = False
+            retired_own_scoped[sid] = own_scoped
+
+        active_fences: set[tuple[str, str]] = set()
+        for key, raw in conn.execute(
+            "SELECT key, value FROM state_meta WHERE key >= ? AND key < ?",
+            (ROUTE_FENCE_PREFIX, cls._prefix_upper_bound(ROUTE_FENCE_PREFIX)),
+        ):
+            ns, sep, sid = key[len(ROUTE_FENCE_PREFIX):].partition(":")
+            if not sep:
+                continue
+            expired = False
+            if isinstance(raw, (str, bytes)):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        exp_flag = parsed.get("expires")
+                        retired_at = parsed.get("retired_at")
+                        if exp_flag and isinstance(retired_at, (int, float)) and not isinstance(retired_at, bool):
+                            if retired_at < cutoff:
+                                expired = True
+                except (ValueError, TypeError, RecursionError):
+                    expired = False
+            if not expired:
+                active_fences.add((ns, sid))
+
+        return retired_own_scoped, active_fences
+
     def replace_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str = "") -> set[str]:
         """Replace the routing index for *routing_scope* as a DELTA (keys absent from *entries* are
         removed); other scopes untouched. Returns the keys skipped as retired routes, which the
@@ -118,25 +177,65 @@ class SQLiteRoutingRepository:
 
         Only added, changed and removed keys are written (``_id_chunks``-sized batches) — a
         whole-scope DELETE + re-insert held the writer mutex for the entire ~20 000-row index
-        (LS-4187: 88 of 235 refusals, p90 29.8 s). The fence is evaluated for EVERY submitted
-        entry inside the same transaction, so an unchanged route whose session was retired is
-        dropped and returned too, exactly as the whole-scope rewrite did.
+        (LS-4187: 88 of 235 refusals, p90 29.8 s). The retirement fence is evaluated via two PK
+        range scans on ``state_meta`` (rather than N per-row SQL round-trips inside the write
+        lock) while preserving exact ``ROUTE_RETIRED_SQL`` semantics.
         """
         now = time.time()
         wanted = {k: v for k, v in entries.items() if k and v}
+        # Validate JSON and extract session_ids BEFORE taking the writer mutex, preserving the
+        # contract that malformed entry JSON raises ``malformed JSON`` without writing anything.
+        parsed_sids: dict[str, Optional[str]] = {}
+        with translated():
+            for key, entry in wanted.items():
+                try:
+                    parsed = json.loads(entry)
+                except (ValueError, TypeError) as exc:
+                    raise sqlite3.OperationalError("malformed JSON") from exc
+                if isinstance(parsed, dict) and parsed.get("session_id") is not None:
+                    raw_sid = parsed["session_id"]
+                    parsed_sids[key] = str(int(raw_sid)) if isinstance(raw_sid, bool) else str(raw_sid)
+                else:
+                    parsed_sids[key] = None
 
         def _do(conn):
             stored = {row["session_key"]: row["entry_json"] for row in conn.execute(
                 "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (routing_scope,))}
+            retired_own_scoped, active_fences = self._load_retirement_fences(conn, now)
+            has_fences = bool(retired_own_scoped or active_fences)
+
             rejected: set[str] = set()
-            to_upsert: list[tuple[str, str]] = []
-            for batch in _id_chunks(list(wanted.items())):
-                for key, entry in batch:
-                    if conn.execute("SELECT " + ROUTE_RETIRED_SQL,
-                                    route_retired_params(key, entry, now)).fetchone()[0]:
+            main_fence_candidates: list[tuple[str, str]] = []
+            if has_fences:
+                for key in wanted:
+                    sid = parsed_sids[key]
+                    if sid is None:
+                        continue
+                    ns = route_namespace(key)
+                    own_scoped = retired_own_scoped.get(sid)
+                    if own_scoped is not None and (ns == "main" or not own_scoped):
                         rejected.add(key)
-                    elif stored.get(key) != entry:
-                        to_upsert.append((key, entry))
+                        continue
+                    if (ns, sid) in active_fences:
+                        if ns != "main":
+                            rejected.add(key)
+                        else:
+                            main_fence_candidates.append((key, sid))
+
+                if main_fence_candidates:
+                    check_sids = list({sid for _, sid in main_fence_candidates})
+                    live_sids: set[str] = set()
+                    for batch in _id_chunks(check_sids):
+                        live_sids |= {row[0] for row in conn.execute(
+                            f"SELECT id FROM sessions WHERE id IN ({_placeholders(batch)})", batch)}
+                    for key, sid in main_fence_candidates:
+                        if sid not in live_sids:
+                            rejected.add(key)
+
+            to_upsert = [
+                (key, entry) for key, entry in wanted.items()
+                if key not in rejected and stored.get(key) != entry
+            ]
             to_delete = [key for key in stored if key not in wanted or key in rejected]
             for batch in _id_chunks(to_delete):
                 conn.execute(f"DELETE FROM gateway_routing WHERE scope = ? AND session_key IN ({_placeholders(batch)})",
@@ -146,14 +245,7 @@ class SQLiteRoutingRepository:
                 params = [value for key, entry in batch for value in (routing_scope, key, entry, now)]
                 conn.execute("INSERT OR REPLACE INTO gateway_routing "
                              "(scope, session_key, entry_json, updated_at) VALUES " + values, params)
-            # The rejected set is what is missing after the write, selected on the submitted
-            # keys only: no full-scope re-select.
-            kept: set[str] = set()
-            for batch in _id_chunks(list(wanted)):
-                kept |= {row[0] for row in conn.execute(
-                    f"SELECT session_key FROM gateway_routing WHERE scope = ? AND session_key IN ({_placeholders(batch)})",
-                    (routing_scope, *batch))}
-            return set(wanted) - kept
+            return rejected
 
         with translated():
             holder = self._store.holder()
