@@ -119,14 +119,16 @@ def _prune_sessions(body: SessionPrune):
                 "newest_started_at": max(r.started_at for r in rows) if rows else None,
                 "sessions": [{k: getattr(r, "session_id" if k == "id" else k) for k in _PRUNE_ROW_KEYS}
                              for r in rows]}
-        from session_retention import after_sessions_removed
+        from session_retention import after_removed_chunk, collect_retired_media
 
         sessions_dir = profile_home / "sessions"
         outcome = store.maintenance.prune_sessions(
             effective_older_than, source, criteria=criteria, exclude_active_write_guards=True,
-            media_root=_media_root())
-        after_sessions_removed(store, store.scope.profile_dir, outcome.deleted_ids, reason="prune",
-                               sessions_dir=sessions_dir if sessions_dir.exists() else None)
+            media_root=_media_root(),
+            on_committed=lambda ids: after_removed_chunk(
+                store.scope.profile_dir, ids, reason="prune",
+                sessions_dir=sessions_dir if sessions_dir.exists() else None))
+        collect_retired_media(store, store.scope.profile_dir)
         return {"ok": True, "removed": outcome.count, "skipped_open": skipped_open}
 
 

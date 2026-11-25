@@ -47,11 +47,13 @@ async def _apply(authority, filters, never_active):
     from gateway.session_mutations import retire_live_sessions
     from gateway.session_persistence import authority_persistence
     from persistence.housekeeping.maintenance import PruneCriteria
-    from session_retention import after_sessions_removed
+    from session_retention import after_removed_chunk, after_sessions_removed, collect_retired_media
     store = authority_persistence(authority)
     # Same transcript dir the CLI's local prune unlinks under (dispatch runs in the owner's scope).
     sessions_dir = Path(get_hermes_home()) / 'sessions'
     media_root = str(native_inputs_root())
+    # The ids of every chunk ``prune_sessions`` committed; read by the failure path below.
+    committed: list[str] = []
 
     def prune_never_active():
         outcome = store.routing.prune_never_active(older_than_days=float(never_active), media_root=media_root)
@@ -65,18 +67,30 @@ async def _apply(authority, filters, never_active):
     def prune_sessions():
         bounds = {key: filters[key] for key in ('older_than_days', 'source') if key in filters}
         criteria = PruneCriteria(**{key: value for key, value in filters.items() if key not in bounds})
+
+        def _committed(ids):
+            committed.extend(ids)
+            # Every chunk runs its own tail straight after its commit (LS-4187 R1).
+            after_removed_chunk(store.scope.profile_dir, ids, reason='prune', sessions_dir=sessions_dir)
+
         outcome = store.maintenance.prune_sessions(
-            **bounds, criteria=criteria, exclude_active_write_guards=True, media_root=media_root)
-        after_sessions_removed(store, store.scope.profile_dir, outcome.deleted_ids, reason='prune',
-                               sessions_dir=sessions_dir)
+            **bounds, criteria=criteria, exclude_active_write_guards=True, media_root=media_root,
+            on_committed=_committed)
+        collect_retired_media(store, store.scope.profile_dir)
         return outcome
 
-    if filters is None:
-        outcome = await asyncio.to_thread(prune_never_active)
-        result = {'deleted': outcome.sessions_deleted, 'routing_deleted': outcome.routing_entries_deleted,
-                  'skipped': outcome.sessions_skipped}
-    else:
-        outcome = await asyncio.to_thread(prune_sessions)
-        result = {'deleted': outcome.count}
+    try:
+        if filters is None:
+            outcome = await asyncio.to_thread(prune_never_active)
+            result = {'deleted': outcome.sessions_deleted, 'routing_deleted': outcome.routing_entries_deleted,
+                      'skipped': outcome.sessions_skipped}
+        else:
+            outcome = await asyncio.to_thread(prune_sessions)
+            result = {'deleted': outcome.count}
+    except BaseException:
+        # ``committed`` grows per committed chunk: retire those ids' live sessions and routes
+        # before the raise propagates, or a mid-pass failure leaks exactly those routes (LS-4187 U1-5).
+        retire_live_sessions(authority, committed)
+        raise
     retire_live_sessions(authority, list(outcome.deleted_ids))
     return result

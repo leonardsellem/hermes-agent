@@ -112,6 +112,15 @@ def collect_retired_media(store, store_home) -> None:
             store.admissions.drop_retired_candidates(gone)
 
 
+def after_removed_chunk(store_home, removed_ids: Sequence[str], *, reason: str, primary: Optional[str] = None,
+                        sessions_dir: Optional[Path] = None) -> None:
+    """The per-committed-chunk tail of a chunked prune: the ``on_session_delete`` hook over
+    *removed_ids*, then their transcript files. Retired media is collected once per pass."""
+    emit_session_deleted(store_home, removed_ids, reason=reason, primary=primary, sessions_dir=sessions_dir)
+    for session_id in removed_ids:
+        remove_session_files(sessions_dir, session_id)
+
+
 def after_sessions_removed(store, store_home, removed_ids: Sequence[str], *, reason: str, primary: Optional[str] = None,
                            sessions_dir: Optional[Path] = None) -> None:
     """The work a delete or prune runs after its write commits, in order: the plugin hook over *removed_ids*, retired-media collection (also when nothing was removed), then the transcript files of every removed id under *sessions_dir*."""
@@ -213,8 +222,10 @@ def run_auto_prune_and_vacuum(
         # watchdog's CPU fallback misreads as a parked deadlock; the lease is renewed per step.
         report_startup_progress(900.0, phase="state_db_auto_prune")
         outcome = store.maintenance.prune_sessions(
-            older_than_days=retention_days, exclude_active_write_guards=True, media_root=media_root)
-        after_sessions_removed(store, store_home, outcome.deleted_ids, reason="prune", sessions_dir=sessions_dir)
+            older_than_days=retention_days, exclude_active_write_guards=True, media_root=media_root,
+            on_committed=lambda ids: after_removed_chunk(
+                store_home, ids, reason="prune", sessions_dir=sessions_dir))
+        collect_retired_media(store, store_home)
         result["pruned"] = pruned = outcome.count
         report_startup_progress(900.0, phase="state_db_auto_sweep")
         closed = store.maintenance.sweep_orphaned_sessions(

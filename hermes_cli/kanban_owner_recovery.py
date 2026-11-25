@@ -81,6 +81,28 @@ def _latest_run_event(conn, task_id, kind):
     return payload if isinstance(payload, dict) else {}
 
 
+# A card's first three consecutive ``managed_worker_failed`` losses are host faults (a state.db
+# write the host refused), so they are requeued uncharged; from the fourth on the normal budget
+# applies and a card that really kills its worker still parks (LS-4187 R4).
+INFRASTRUCTURE_REQUEUE_LIMIT = 3
+
+
+def _trailing_crashed_runs(conn, task_id) -> int:
+    """The card's trailing consecutive closed ``crashed`` runs; any other outcome ends the streak.
+
+    Read before the current run closes: an infrastructure requeue never increments
+    ``consecutive_failures``, so the run history is the only bound that survives it.
+    """
+    streak = 0
+    for (outcome,) in conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC, id DESC", (task_id,)):
+        if outcome != "crashed":
+            break
+        streak += 1
+    return streak
+
+
 def _host_local_lock(lock) -> bool:
     """True when ``lock`` was issued by this host — the only pids we can judge."""
     from hermes_cli import kanban_db as kb
@@ -220,10 +242,18 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
 
     A bound interpreter whose ``worker_result`` says exit 0 after its managed execution was
     lost reads as a protocol violation. The owner's ``worker_lost`` evidence outranks it: the
-    turn never finished, so it books as a crash and charges the breaker, and the
-    protocol-violation streak (which reads the persisted payload) does not count it.
+    turn never finished, so it books as a crash, and the protocol-violation streak (which
+    reads the persisted payload) does not count it.
+
+    A ``managed_worker_failed`` loss is a HOST fault, not the card's: it is booked
+    ``infrastructure: true`` (uncharged, spaced retries) while the card's trailing consecutive
+    crash streak is below :data:`INFRASTRUCTURE_REQUEUE_LIMIT`; from the fourth consecutive
+    loss on every loss is charged and the normal budget applies (LS-4187 R3/R4).
     """
     lost = _latest_run_event(conn, task_id, "worker_lost")
+    if (str(lost.get("reason") or "") == "managed_worker_failed"
+            and _trailing_crashed_runs(conn, task_id) < INFRASTRUCTURE_REQUEUE_LIMIT):
+        dead.event_payload["infrastructure"] = True
     note = owner_attempt_note(conn, task_id, lost)
     if not note:
         return

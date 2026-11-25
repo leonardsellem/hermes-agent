@@ -94,6 +94,14 @@ _LIVE_LEDGER_SQL = """SELECT 1 FROM session_admissions WHERE target_session_id=?
     UNION ALL SELECT 1 FROM worker_executions WHERE session_id=? AND status IN ('registered','running','unknown') LIMIT 1"""
 
 
+def has_live_work(conn, session_id) -> bool:
+    """True when a live/queued admission or worker names *session_id* (a sweep must skip it).
+
+    Read-only, so a chunked prune can re-check it inside the transaction that fences and deletes
+    the id (LS-4187 R1: no committed fence without the delete)."""
+    return bool(conn.execute(_LIVE_LEDGER_SQL, (session_id, session_id)).fetchone())
+
+
 def retire_sessions(conn, session_ids, *, expiring=(), media_root):
     """The complete deletion fence for ids that are being deleted in this transaction.
 
@@ -173,6 +181,40 @@ def _derived_api_sessions(conn, session_ids):
         (json.dumps(list(session_ids)),))}
 
 
+def local_conversations(conn):
+    """Read-only: the current ``(member map, derived ids)`` of local conversations.
+
+    Exposed for callers that must re-check membership inside a later transaction (a chunked
+    prune): a receipt's lineage can grow between classification and the delete."""
+    return _local_conversations(conn)
+
+
+def prunable_ids(conn, session_ids):
+    """Read-only half of :func:`retire_prunable`: ``(quiet ids, derived ids, units)``.
+
+    Same sweep rules (whole local conversation, no live/unknown work); nothing is written, so a
+    chunked prune can classify once and then fence each unit inside the transaction that deletes
+    it. ``units`` groups the quiet ids by whole local conversation, in selection order: a chunked
+    caller must never split one unit, or a conversation is deleted half-way."""
+    swept, (conversations, derived) = set(session_ids), _local_conversations(conn)
+
+    def removable(sid):
+        whole = conversations.get(sid, (sid,))
+        return swept.issuperset(whole) and not any(has_live_work(conn, x) for x in whole)
+    quiet = [sid for sid in session_ids if removable(sid)]
+    derived |= _derived_api_sessions(conn, quiet)
+    quiet_set = set(quiet)
+    seen: set[str] = set()
+    units: list[tuple[str, ...]] = []
+    for sid in quiet:
+        if sid in seen:
+            continue
+        unit = tuple(dict.fromkeys(x for x in conversations.get(sid, (sid,)) if x in quiet_set))
+        seen.update(unit)
+        units.append(unit)
+    return quiet, derived, units
+
+
 def retire_prunable(conn, session_ids, *, media_root):
     """Sweep variant of :func:`retire_sessions`: fence the idle sessions and return only those ids.
     A session with live or unknown work is skipped, so one busy row cannot abort a whole
@@ -187,13 +229,7 @@ def retire_prunable(conn, session_ids, *, media_root):
     first unfenced id, so an aged-out marker would send the next turn back to the swept generation.
     A Bot Chat's mailbox receipts also outlive the horizon. A caller-named API id is not derived:
     its marker ages out, so the caller can use that id again, as for any other swept session."""
-    swept, (conversations, derived) = set(session_ids), _local_conversations(conn)
-
-    def removable(sid):
-        whole = conversations.get(sid, (sid,))
-        return swept.issuperset(whole) and not any(conn.execute(_LIVE_LEDGER_SQL, (x, x)).fetchone() for x in whole)
-    quiet = [sid for sid in session_ids if removable(sid)]
-    derived |= _derived_api_sessions(conn, quiet)
+    quiet, derived, _units = prunable_ids(conn, session_ids)
     retire_sessions(conn, quiet, expiring=[sid for sid in quiet if sid not in derived], media_root=media_root)
     return quiet
 

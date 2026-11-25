@@ -12,7 +12,7 @@ import os
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
 from persistence.conversation.sessions import CANONICAL_BOT_CHAT_TITLE
 from persistence.core.errors import ExportTooLarge
@@ -23,7 +23,9 @@ from persistence.housekeeping.maintenance import (
 
 from .._backend import SQLiteStore, register_repository, translated
 from ..conversation._store.core import _delete_unreferenced_system_prompts
-from ..conversation._store.retirement import retire_prunable
+from ..conversation._store.retirement import (
+    has_live_work, local_conversations, prunable_ids, retire_prunable, retire_sessions,
+)
 from ..conversation._store.sessions import _cwd_prefix_clause, _set_lineage_column_in_transaction
 from ..conversation._store.sql_common import _non_continuation_child_sql
 from ..conversation._store.write_guards import _guarded_ids, _write_guards_reject
@@ -37,6 +39,31 @@ __all__ = ["SQLiteSessionMaintenance"]
 _LAST_ACTIVE_SQL = _sql_session_last_active("s")
 _TOKENS_SQL = "(COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0))"
 _COST_SQL = "COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0)"
+
+# Ids per prune write transaction. The 2026-11-24 store (14.8 GB): 103 prune-mutex holds, p50
+# 848 s for ~3 000 ids => ~0.28 s/id, so 32 ids is ~9 s against the 10 s per-write budget
+# (LS-4187 U0(g)/U2). Re-measure on a materially different store before raising it.
+_PRUNE_WRITE_CHUNK = 32
+
+
+def _prune_batches(units, size: int):
+    """Greedily pack whole-conversation *units* into batches of at most *size* ids.
+
+    One unit larger than *size* rides alone: atomicity beats the per-write budget there — a local
+    conversation is small in practice (the repo documents ~180-deep rotation chains as the worst
+    case), and a half-deleted conversation is unrecoverable. shortcut: a unit wider than the budget
+    makes that ONE transaction exceed the 10 s target; upgrade to a conversation-level soft-delete
+    if lineages ever grow past the budget on the live store."""
+    batch: list[tuple[str, ...]] = []
+    count = 0
+    for unit in units:
+        if batch and count + len(unit) > size:
+            yield batch
+            batch, count = [], 0
+        batch.append(unit)
+        count += len(unit)
+    if batch:
+        yield batch
 
 # Ids per ``IN (?,...)`` list: SQLite caps bound parameters at SQLITE_MAX_VARIABLE_NUMBER (999 on builds
 # < 3.32, 32766 after), and a bulk prune of a cron-heavy store binds tens of thousands of ids.
@@ -237,36 +264,78 @@ class SQLiteSessionMaintenance(SessionPortability):
 
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: Optional[str] = None, *,
                        criteria: PruneCriteria = PruneCriteria(), exclude_active_write_guards: bool = False,
-                       media_root: str) -> PruneResult:
+                       media_root: str, on_committed: Optional[Callable[[tuple[str, ...]], None]] = None,
+                       ) -> PruneResult:
         filters = asdict(criteria)
         if filters.get("include_open"):
             # Deletion is not reversible, so the ended-session guard is structural here: the
-            # archive-only escape hatch must never reach the delete path.
+            # archive-only escape hatch (#139597) must never reach the delete path.
             raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
         where, where_params = _prune_where(older_than_days, source, filters, whole_lineages=True)
-        removed_ids: list[str] = []
-        def _do(conn):
-            cursor = conn.execute(f"SELECT s.id FROM sessions s WHERE {where}", where_params)
-            session_ids = {row["id"] for row in cursor.fetchall()}
-            if exclude_active_write_guards:
-                session_ids -= _guarded_ids(holder, conn, session_ids)
-            session_ids = retire_prunable(conn, sorted(session_ids), media_root=media_root)
-            prune_retired_tombstones(conn)  # every prune pass also reclaims expired deletion tombstones
-            if not session_ids:
-                return 0
-            # Batched: a cron-heavy store prunes tens of thousands of ids in one call.
-            for chunk in _id_chunks(session_ids):
-                ph = _placeholders(chunk)
-                conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
-                removed_ids.extend(chunk)
-            _delete_unreferenced_system_prompts(conn)
-            return len(session_ids)
         with translated():
             holder = self._store.holder()
-            count = holder._execute_write(_do)
-        return PruneResult(count=count, deleted_ids=tuple(SessionId(sid) for sid in removed_ids))
+            # Read-only selection; the writer mutex is taken only for the small retirement write and
+            # one transaction per chunk, never for the whole pass (LS-4187 R1).
+            with holder._read_ctx() as conn:
+                session_ids = {row["id"] for row in conn.execute(
+                    f"SELECT s.id FROM sessions s WHERE {where}", where_params).fetchall()}
+
+            def _retire(conn):
+                if exclude_active_write_guards:
+                    session_ids.difference_update(_guarded_ids(holder, conn, session_ids))
+                quiet, derived, units = prunable_ids(conn, sorted(session_ids))
+                prune_retired_tombstones(conn)  # every prune pass also reclaims expired deletion tombstones
+                return quiet, derived, units
+
+            quiet_ids, derived_ids, units = holder._execute_write(_retire) or ([], set(), [])
+            expiring_ids = set(quiet_ids) - derived_ids
+            removed_ids: list[str] = []
+            for batch in _prune_batches(units, _PRUNE_WRITE_CHUNK):
+                def _write_chunk(conn, batch=batch):
+                    # Re-validate each WHOLE conversation inside the transaction that fences AND
+                    # deletes: one member that became live, active or unreachable skips the unit, so a
+                    # conversation is never deleted half-way and no fence is committed without its
+                    # delete (LS-4187 R1). Membership is re-read too: a lineage that grew since the
+                    # classification (a compression/reset child) is deferred to the next pass.
+                    conversations, _derived = local_conversations(conn)
+                    allowed: list[str] = []
+                    for unit in batch:
+                        current = set(conversations.get(unit[0], (unit[0],)))
+                        if current != set(unit):
+                            continue
+                        fresh = {row["id"] for row in conn.execute(
+                            f"SELECT s.id FROM sessions s WHERE ({where}) AND s.id IN ({_placeholders(unit)})",
+                            (*where_params, *unit))}
+                        live = _guarded_ids(holder, conn, unit)
+                        if any(sid not in fresh or sid in live or has_live_work(conn, sid) for sid in unit):
+                            continue
+                        allowed.extend(unit)
+                    if not allowed:
+                        return []
+                    retire_sessions(conn, allowed, expiring=[sid for sid in allowed if sid in expiring_ids],
+                                    media_root=media_root)
+                    ph = _placeholders(allowed)
+                    conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", allowed)
+                    conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", allowed)
+                    conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", allowed)
+                    return allowed
+
+                committed = holder._execute_write(_write_chunk) or []
+                if not committed:
+                    continue
+                # Per-chunk tail after this chunk's commit: a failure at chunk N leaves no committed
+                # chunk without its transcript files and gateway route retirement (LS-4187 R1/U1-5).
+                if on_committed is not None:
+                    on_committed(tuple(committed))
+                removed_ids.extend(committed)
+
+            if removed_ids:
+                def _cleanup_prompts(conn):
+                    _delete_unreferenced_system_prompts(conn)
+
+                # Its own write: it must see the deletions and run inside a write transaction.
+                holder._execute_write(_cleanup_prompts)
+        return PruneResult(count=len(removed_ids), deleted_ids=tuple(SessionId(sid) for sid in removed_ids))
 
     def prune_empty_ghost_sessions(self, *, media_root: str) -> tuple[SessionId, ...]:
         cutoff = time.time() - 86400

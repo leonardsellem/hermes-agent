@@ -359,7 +359,7 @@ class InMemoryMaintenance:
             prunable=len(prunable), total=total, prunable_bytes=measured(prunable), total_bytes=measured(list(transcripts)) if measure_total_bytes else None,
         )
 
-    def prune_sessions(self, older_than_days: Optional[float] = 90, source: Optional[str] = None, *, criteria: PruneCriteria = PruneCriteria(), exclude_active_write_guards: bool = False, media_root: str) -> PruneResult:
+    def prune_sessions(self, older_than_days: Optional[float] = 90, source: Optional[str] = None, *, criteria: PruneCriteria = PruneCriteria(), exclude_active_write_guards: bool = False, media_root: str, on_committed: Optional[Callable[[tuple[str, ...]], None]] = None) -> PruneResult:
         if criteria.include_open:
             raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
         selected = self._whole_lineages(self._selected(self._resolved(older_than_days, criteria), source))
@@ -379,6 +379,8 @@ class InMemoryMaintenance:
             for row in staged.scope.get("sessions", {}).values():
                 if row["parent_session_id"] in doomed:
                     row["parent_session_id"] = None
+        if on_committed is not None and doomed:
+            on_committed(tuple(doomed))
         return PruneResult(count=len(doomed), deleted_ids=tuple(SessionId(sid) for sid in doomed))
 
     def prune_empty_ghost_sessions(self, *, media_root: str) -> tuple[SessionId, ...]:

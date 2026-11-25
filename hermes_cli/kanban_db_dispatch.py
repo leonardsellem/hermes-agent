@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- LS-4187: the crash-accounting change is a 2-line infrastructure branch in the existing chokepoint (+5 net lines); this module is already 28 lines over its value on main (2897) at the ab7cb7d0ad base, and the approved change set forbids a package split here
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
@@ -1302,7 +1303,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            infrastructure = bool(dead.event_payload.get("infrastructure"))
+            is_systemic = not infrastructure and fp_counts.get(_error_fingerprint(error_text), 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
             if is_systemic:
                 # Trips at 1, below any ``failure_limit``: hold it for an operator.
@@ -1314,6 +1316,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 failure_limit=1 if is_systemic else None,
                 release_claim=False,
                 end_run=False,
+                infrastructure=infrastructure,
                 event_payload_extra=extra,
             )
         if tripped:
@@ -1562,7 +1565,8 @@ def check_respawn_guard(
 
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
-    refused — no restart-safe scope — within the cooldown; never counted),
+    refused — no restart-safe scope — or a crash booked with
+    ``infrastructure: true``, within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
@@ -1589,7 +1593,9 @@ def check_respawn_guard(
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
     #    An infrastructure spawn refusal (#114720) shares the cooldown: the host
     #    condition is not the card's (its text may still say 403), so it retries
-    #    forever, spaced, and reaches neither the breaker nor blocker_auth.
+    #    forever, spaced, and reaches neither the breaker nor blocker_auth. A crash
+    #    booked as infrastructure (a managed worker lost to the host, LS-4187) is
+    #    spaced the same way.
     rl_cooldown = _kb._resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
@@ -1597,7 +1603,7 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC, id DESC LIMIT 1",  # runs end on whole seconds: the later insert wins a tie
         (task_id,),
     ).fetchone()
-    infrastructure = (latest_run is not None and latest_run["outcome"] == "spawn_failed"
+    infrastructure = (latest_run is not None and latest_run["outcome"] in ("spawn_failed", "crashed")
                       and bool(_kb._json_dict(latest_run["metadata"]).get("infrastructure")))
     ended_at = _kb._to_epoch(latest_run["ended_at"]) if infrastructure else None
     if rl_cooldown > 0 and ended_at is not None and (now - ended_at) < rl_cooldown:

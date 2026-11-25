@@ -894,11 +894,12 @@ def _cmd_prune_or_archive(args, action, *, persistence=None):
         except (GatewayClientError, OSError, TimeoutError) as exc:
             return report_owner_failure(exc)
     elif prune:
-        from session_retention import after_sessions_removed
+        from session_retention import after_removed_chunk, collect_retired_media
         outcome = persistence.maintenance.prune_sessions(
-            **bounds, criteria=criteria, exclude_active_write_guards=True, media_root=_media_root())
-        after_sessions_removed(persistence, persistence.scope.profile_dir, outcome.deleted_ids, reason="prune",
-                               sessions_dir=_sessions_dir())
+            **bounds, criteria=criteria, exclude_active_write_guards=True, media_root=_media_root(),
+            on_committed=lambda ids: after_removed_chunk(
+                persistence.scope.profile_dir, ids, reason="prune", sessions_dir=_sessions_dir()))
+        collect_retired_media(persistence, persistence.scope.profile_dir)
         print(f"Pruned {outcome.count} session(s).")
     else:
         from session_retention import archive_sessions

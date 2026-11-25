@@ -240,11 +240,12 @@ def test_run_auto_prune_prunes_closes_and_vacuums(backend, scope_a, sessions_dir
     assert result == {"skipped": False, "pruned": 2, "closed": 1, "vacuumed": True, "freelist_ratio": 0.0}
     assert _messages(caplog) == [("INFO", "state.db auto-maintenance: closed 1 stale open session(s), pruned 2 session(s) inactive for 90 days + VACUUM")]
     files = ["request_dump_s-old1_1.json", "s-old1.json", "s-old1.jsonl", "session_s-old1.json"]
-    # CONTRACT: the prune's post-commit work in order, the transcript files last.
+    # CONTRACT: the prune's post-commit work runs per committed chunk (LS-4187 R1): the hook sees
+    # the chunk's transcript files, then removes them; media is collected once afterwards.
     assert events == [
         ["hook", "on_session_delete", {"session_id": "s-old1", "reason": "prune", "profile": "profile-a", "deleted_ids": ["s-old1", "s-old2"],
                                        "sessions_dir": str(sessions_dir)}, str(scope_a.profile_dir), files],
-        ["collect", files],
+        ["collect", []],
     ]
     assert _files(sessions_dir) == []
     rows = {sid: store.sessions.get(SessionId(sid)) for sid in ("s-old1", "s-old2", "s-open-cli", "s-open-tui", "s-recent")}
