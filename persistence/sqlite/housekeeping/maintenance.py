@@ -23,6 +23,7 @@ from persistence.housekeeping.maintenance import (
 
 from .._backend import SQLiteStore, register_repository, translated
 from ..conversation._store.core import _delete_unreferenced_system_prompts
+from ..conversation._store.local import local_lineage_owner
 from ..conversation._store.retirement import (
     has_live_work, local_conversations, prunable_ids, retire_prunable, retire_sessions,
 )
@@ -297,9 +298,21 @@ class SQLiteSessionMaintenance(SessionPortability):
                     # conversation is never deleted half-way and no fence is committed without its
                     # delete (LS-4187 R1). Membership is re-read too: a lineage that grew since the
                     # classification (a compression/reset child) is deferred to the next pass.
-                    conversations, _derived = local_conversations(conn)
+                    # Bounded to this batch: a full receipt scan here made every chunk O(store)
+                    # (7 551 receipts / 408 MB on the 2026-11-26 live store, 5.8–22.8 s cold).
+                    candidates = tuple(sid for unit in batch for sid in unit)
+                    conversations, _derived = local_conversations(conn, candidates)
                     allowed: list[str] = []
                     for unit in batch:
+                        if unit[0] not in conversations:
+                            # No receipt is keyed by the unit: a reset/compression child's receipt
+                            # sits under the creation id its chat_id names.
+                            owner = local_lineage_owner(conn, unit[0])
+                            if owner != unit[0]:
+                                if owner not in candidates:
+                                    conversations.update(local_conversations(conn, [owner])[0])
+                                if unit[0] not in conversations:
+                                    continue  # no receipt names its lineage: defer, as an unreachable member does
                         current = set(conversations.get(unit[0], (unit[0],)))
                         if current != set(unit):
                             continue
@@ -313,7 +326,7 @@ class SQLiteSessionMaintenance(SessionPortability):
                     if not allowed:
                         return []
                     retire_sessions(conn, allowed, expiring=[sid for sid in allowed if sid in expiring_ids],
-                                    media_root=media_root)
+                                    media_root=media_root, receipt_ids=candidates)
                     ph = _placeholders(allowed)
                     conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", allowed)
                     conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", allowed)
