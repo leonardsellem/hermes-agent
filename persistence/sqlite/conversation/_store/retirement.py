@@ -102,7 +102,7 @@ def has_live_work(conn, session_id) -> bool:
     return bool(conn.execute(_LIVE_LEDGER_SQL, (session_id, session_id)).fetchone())
 
 
-def retire_sessions(conn, session_ids, *, expiring=(), media_root):
+def retire_sessions(conn, session_ids, *, expiring=(), media_root, receipt_ids=None):
     """The complete deletion fence for ids that are being deleted in this transaction.
 
     Terminal receipts alone are not enough: without the ``RETIRED_PREFIX`` marker an exact
@@ -110,14 +110,15 @@ def retire_sessions(conn, session_ids, *, expiring=(), media_root):
     accounting/constructor backfill recreates the deleted row, and the same request is then
     admitted a second time against it. Every delete path (canonical mutate, legacy
     ``delete_session*``, prunes and sweeps) must publish the whole fence, so it lives here once.
-    The marker of an id in *expiring* (a housekeeping sweep's) ages out at the retry horizon."""
+    The marker of an id in *expiring* (a housekeeping sweep's) ages out at the retry horizon.
+    *receipt_ids* bounds the local-receipt read to those creation ids (a chunked prune's batch)."""
     from persistence.sqlite.conversation._store.media import retire_spillover
     retire_spillover(conn, session_ids)  # before the caller's DELETEs take the pointers away
     retire_terminal_receipts(conn, session_ids, media_root=media_root)
     retire_mutation_receipts(conn, session_ids)
     retire_routes(conn, session_ids, expiring=expiring)
     from persistence.sqlite.conversation._store.local import retire_local_receipts
-    retire_local_receipts(conn, session_ids)
+    retire_local_receipts(conn, session_ids, receipt_ids)
 
 
 _MUTATION_TRANSCRIPT_FIELDS = ('target_message', 'summary', 'title')
@@ -151,14 +152,15 @@ _DERIVED_LOCAL_PREFIXES = ('bot-chat:', 'a2a:')
 _DERIVED_API_SQL = ("(source='bot_room' OR (source='api_server' AND id GLOB 'api-" + '[0-9a-f]' * 16 + "'))")
 
 
-def _local_conversations(conn):
+def _local_conversations(conn, receipt_ids=None):
     """``(members, derived)``: member id -> every id of its local conversation (the creation id
     (policy, FIFO, generation), each receipt lineage segment and the current target), and the ids
-    of every derived (Bot Chat, A2A) conversation. One prefix scan, not a lookup per swept id.
+    of every derived (Bot Chat, A2A) conversation. One prefix scan, not a lookup per swept id;
+    *receipt_ids* bounds that scan to those creation ids (a chunked prune's batch).
     Malformed receipts name nothing."""
-    from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+    from persistence.sqlite.conversation._store.local import _policy_receipt_rows
     members, derived = {}, set()
-    for (raw,) in conn.execute('SELECT value FROM state_meta WHERE key GLOB ?', (POLICY_PREFIX + '*',)):
+    for _key, raw in _policy_receipt_rows(conn, receipt_ids):
         try:
             receipt = json.loads(raw)
         except (TypeError, ValueError):
@@ -181,12 +183,13 @@ def _derived_api_sessions(conn, session_ids):
         (json.dumps(list(session_ids)),))}
 
 
-def local_conversations(conn):
+def local_conversations(conn, receipt_ids=None):
     """Read-only: the current ``(member map, derived ids)`` of local conversations.
 
     Exposed for callers that must re-check membership inside a later transaction (a chunked
-    prune): a receipt's lineage can grow between classification and the delete."""
-    return _local_conversations(conn)
+    prune): a receipt's lineage can grow between classification and the delete. *receipt_ids*
+    bounds the read to those creation ids, so a chunk pays for its batch, not the store."""
+    return _local_conversations(conn, receipt_ids)
 
 
 def prunable_ids(conn, session_ids):

@@ -56,7 +56,19 @@ def _seed_conversation(db, members):
     from persistence.sqlite.conversation._store.local import POLICY_PREFIX
     db._execute_write(lambda conn: conn.execute(
         "INSERT INTO state_meta (key, value) VALUES (?, ?)",
-        (POLICY_PREFIX + members[0], json.dumps({"session_id": members[0], "lineage": list(members)}))))
+        (POLICY_PREFIX + members[0], json.dumps({"session_id": members[0], "lineage": list(members),
+                                                 "entry": {"session_id": members[-1]}}))))
+
+
+def _seed_receipts(db, prefix, count):
+    """*count* policy receipts outside the prune: a real single-segment lineage each."""
+    from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+    values = [(POLICY_PREFIX + f"{prefix}-{i:05d}",
+               json.dumps({"session_id": f"{prefix}-{i:05d}", "lineage": [f"{prefix}-{i:05d}"],
+                           "entry": {"session_id": f"{prefix}-{i:05d}"}, "request_id": f"req-{prefix}-{i}"}))
+              for i in range(count)]
+    db._execute_write(lambda conn: conn.executemany(
+        "INSERT INTO state_meta (key, value) VALUES (?, ?)", values))
 
 
 def _tail(sessions_dir, deleted_ids):
@@ -193,6 +205,7 @@ def test_a_resume_after_the_retirement_write_keeps_its_session(store, db, monkey
 def test_the_slowest_prune_write_stays_under_the_budget(store, db, monkeypatch, sessions_dir, media_root):
     from persistence.sqlite.housekeeping.maintenance import _PRUNE_WRITE_CHUNK
     ids = _seed(db, _PRUNE_WRITE_CHUNK * 2, sessions_dir=sessions_dir)
+    _seed_receipts(db, "budget", 2_000)
     real = db._execute_write
     slowest = [0.0]
 
@@ -206,8 +219,72 @@ def test_the_slowest_prune_write_stays_under_the_budget(store, db, monkeypatch, 
     monkeypatch.setattr(db, "_execute_write", timed)
     pruned = store.maintenance.prune_sessions(older_than_days=10, media_root=media_root)
     assert pruned.count == len(ids)
-    print(f"chunk_size={_PRUNE_WRITE_CHUNK} slowest_write={slowest[0]:.3f}s")
+    print(f"chunk_size={_PRUNE_WRITE_CHUNK} receipts=2000 slowest_write={slowest[0]:.3f}s")
     assert slowest[0] < 10.0
+
+
+def _chunk_census(store, monkeypatch, root, foreign_receipts):
+    """One two-chunk prune beside *foreign_receipts* unrelated receipts: per chunk, the
+    ``state_meta`` SELECT statements it issued and the rows those reads returned."""
+    from persistence.sqlite.housekeeping.maintenance import _PRUNE_WRITE_CHUNK
+
+    db = store.holder()
+    sessions_dir, media_root = root / "sessions", str(root / "media")
+    members = ["conv-000", "conv-001"]
+    ids = _seed(db, _PRUNE_WRITE_CHUNK + 2, sessions_dir=sessions_dir)
+    _seed(db, ids=members, sessions_dir=sessions_dir)
+    _seed_conversation(db, members)
+    _seed_receipts(db, "foreign", foreign_receipts)
+
+    samples = []
+    state = {"armed": False, "reading": False, "statements": [], "rows": 0}
+    real, real_factory = db._execute_write, db._conn.row_factory
+
+    def trace(sql):
+        state["reading"] = sql.lstrip().upper().startswith("SELECT") and "FROM state_meta" in sql
+        if state["armed"] and state["reading"]:
+            state["statements"].append(sql)
+
+    def row_factory(cursor, row):
+        # Count a state_meta SELECT's own rows: keyed on its shape, not only on the last trace.
+        if state["armed"] and state["reading"] and tuple(d[0] for d in cursor.description) in {("key", "value"), ("value",)}:
+            state["rows"] += 1
+        return real_factory(cursor, row)
+
+    def spy(fn, patience_s=None):
+        if fn.__name__ != "_write_chunk":
+            return real(fn, patience_s)
+        state.update(armed=True, reading=False, statements=[], rows=0)
+        try:
+            return real(fn, patience_s)
+        finally:
+            state["armed"] = False
+            samples.append((tuple(state["statements"]), state["rows"]))
+
+    monkeypatch.setattr(db, "_execute_write", spy)
+    db._conn.set_trace_callback(trace)
+    db._conn.row_factory = row_factory
+    try:
+        pruned = store.maintenance.prune_sessions(older_than_days=10, media_root=media_root)
+    finally:
+        db._conn.set_trace_callback(None)
+        db._conn.row_factory = real_factory
+    return samples, pruned, len(ids) + len(members)
+
+
+def test_the_chunk_read_cost_is_independent_of_the_receipt_set(backend, scope_a, scope_b, monkeypatch, tmp_path):
+    """R1 residual: a chunk re-validates its own batch, not the store's whole receipt set.
+
+    The same prune beside 2 and beside 2 000 unrelated receipts must issue the same ``state_meta``
+    reads and scan the same rows; a full policy-receipt scan here is the 5.8–22.8 s hold class.
+    """
+    small, small_pruned, count = _chunk_census(backend.open(scope_a), monkeypatch, tmp_path / "two", 2)
+    large, large_pruned, _ = _chunk_census(backend.open(scope_b), monkeypatch, tmp_path / "many", 2_000)
+    assert small_pruned.count == large_pruned.count == count
+    assert small == large
+    assert sum(rows for _statements, rows in large) == 2  # only the pruned conversation's own receipt
+    reads = [sql for statements, _rows in large for sql in statements]
+    assert not [sql for sql in reads if "gateway.local_policy.v1:*" in sql], reads
 
 
 def test_a_whole_conversation_is_deleted_in_one_chunk(store, db, monkeypatch, sessions_dir, media_root):

@@ -27,18 +27,33 @@ def _policy_target(raw):
     return entry.get('session_id') if isinstance(entry, dict) else None
 
 
-def retire_local_receipts(conn, session_ids):
+def _policy_receipt_rows(conn, receipt_ids=None):
+    """``(key, value)`` of the local creation receipts: the whole prefix (GLOB uses the key index),
+    or only the rows keyed by *receipt_ids* — the same rows a caller's batch can name, read by
+    primary key so a prune chunk does not re-read the whole receipt set."""
+    if receipt_ids is None:
+        return conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?', (POLICY_PREFIX + '*',))
+    keys = [POLICY_PREFIX + sid for sid in receipt_ids]
+    if not keys:
+        return ()
+    return conn.execute(f'SELECT key,value FROM state_meta WHERE key IN ({",".join("?" * len(keys))})', keys)
+
+
+def retire_local_receipts(conn, session_ids, receipt_ids=None):
     """Deletion fence half for owner receipts. A local creation policy carries the launch request
     (``request_json``: a cron fire's job and raw prompt), so it goes exactly when its route does:
     when the receipt's current physical target is deleted (a pruned reset ancestor whose logical
     session lives on in a child keeps it). An API binding and the declared conversation key that
-    resolves to it go with their id, so that key starts a fresh session."""
+    resolves to it go with their id, so that key starts a fresh session.
+
+    *receipt_ids* bounds the policy read to those creation ids (a chunked prune's batch);
+    ``None`` reads every receipt once."""
     targets = set(session_ids)
     if not targets:
         return
-    # Prefix scans (GLOB uses the key index), not one LIKE per id: a prune retires thousands.
-    gone = [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
-                                               (POLICY_PREFIX + '*',))
+    # Unbounded: one prefix scan (GLOB uses the key index), not one LIKE per id — a prune retires
+    # thousands. Bounded: only the caller's own receipt keys.
+    gone = [key for key, value in _policy_receipt_rows(conn, receipt_ids)
             if _policy_target(value) in targets]
     gone += [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
                                                 (API_DECLARED_PREFIX + '*',)) if value in targets]
