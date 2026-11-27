@@ -15,12 +15,31 @@ from tui_gateway import server
 from tui_gateway import ws as ws_mod
 
 
+class _HandledDisconnect(ws_mod._WebSocketDisconnect):
+    """A client hang-up that marks when the read loop handles it: handle_ws reads ``exc.code`` and
+    takes its unanswered snapshot in one synchronous step, so ``handled`` set means the snapshot exists."""
+
+    def __init__(self, handled):
+        super().__init__()
+        self._handled = handled
+
+    @property
+    def code(self):
+        self._handled.set()
+        return 1000
+
+    @code.setter
+    def code(self, _value):
+        pass
+
+
 class Socket:
     def __init__(self):
         self.inbound = asyncio.Queue()
         self.received = 0
         self.sent = []
         self.fail_ids = set()
+        self.disconnect_handled = asyncio.Event()
 
     async def accept(self):
         pass
@@ -34,7 +53,7 @@ class Socket:
     async def receive_text(self):
         item = await self.inbound.get()
         if item is None:
-            raise ws_mod._WebSocketDisconnect()
+            raise _HandledDisconnect(self.disconnect_handled)
         self.received += 1
         return json.dumps(item)
 
@@ -261,7 +280,7 @@ async def test_close_line_reports_unanswered_and_oldest_wait(rig, caplog):
     sock.inbound.put_nowait(rpc(2, "prompt.submit"))
     assert await settle(lambda: sock.received == 2)
     sock.inbound.put_nowait(None)  # the disconnect is detected while 1 runs and 2 waits
-    await asyncio.sleep(0.1)  # let the read loop take its pre-drain snapshot
+    await asyncio.wait_for(sock.disconnect_handled.wait(), 5)
     release.set()
     await asyncio.wait_for(task, 30)
     assert "done:2" in log  # the drain really did finish both
@@ -293,7 +312,7 @@ async def test_close_line_carries_no_request_params(rig, caplog):
                              "params": {"prompt": "MARKER-prose-must-not-be-logged"}})
     assert await settle(lambda: "start:7" in log)
     sock.inbound.put_nowait(None)
-    await asyncio.sleep(0.1)  # let the read loop take its pre-drain snapshot
+    await asyncio.wait_for(sock.disconnect_handled.wait(), 5)
     release.set()
     await asyncio.wait_for(task, 30)
     line = _close_line(caplog)
