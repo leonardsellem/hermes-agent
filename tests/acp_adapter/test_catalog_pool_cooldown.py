@@ -44,7 +44,7 @@ def test_sibling_model_bench_does_not_remove_codex_picker(
     # discovery's external registry/catalog boundary is replaced with offline data.
     monkeypatch.setattr(inventory, "build_models_payload", native_build_models_payload)
     monkeypatch.setattr(inventory, "load_picker_context", native_load_picker_context)
-    monkeypatch.setattr(models_dev, "fetch_models_dev", lambda: {})
+    monkeypatch.setattr(models_dev, "fetch_models_dev", dict)
     monkeypatch.setattr(providers, "HERMES_OVERLAYS", {
         "openai-codex": providers.HERMES_OVERLAYS["openai-codex"],
     })
