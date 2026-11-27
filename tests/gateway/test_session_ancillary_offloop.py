@@ -17,6 +17,7 @@ import pytest
 from gateway import session_ancillary
 from gateway import session_managed_worker
 from gateway.config import Platform
+from tests.waiting import async_wait_until
 
 SID, ROUTE = 'sid-1', 'route-1'
 BLOCK_S = 1.0
@@ -45,12 +46,13 @@ class Authority:
         return self._agent
 
 
-def _blocked(barrier, value, delay=BLOCK_S):
+def _blocked(barrier, value, release=None):
     """A store read that blocks its thread, as the SQLite/file read does (never yields)."""
     def read(*_args, **_kwargs):
         if barrier is not None:
             barrier.set()
-        time.sleep(delay)
+        if release is not None:
+            release.wait(BLOCK_S)
         return value
     return read
 
@@ -72,11 +74,10 @@ def rig(monkeypatch):
 def _stub_local_receipt(monkeypatch, connection, **kwargs):
     monkeypatch.setattr(
         connection.authority.persistence.bindings, 'receipt',
-        _blocked(kwargs.get('barrier'), SimpleNamespace(current_target=SID),
-                 kwargs.get('delay', BLOCK_S)))
+        _blocked(kwargs.get('barrier'), SimpleNamespace(current_target=SID), kwargs.get('release')))
 
 
-async def _max_gap(during):
+async def _max_gap(during, barrier, release):
     gaps, running = [], True
 
     async def tick():
@@ -87,13 +88,19 @@ async def _max_gap(during):
             gaps.append(now - last)
             last = now
 
-    task = asyncio.create_task(tick())
+    ticker = asyncio.create_task(tick())
     await asyncio.sleep(0)
+    read = asyncio.create_task(during())
     try:
-        await during()
+        await async_wait_until(barrier.is_set, timeout=5, what='the store read to start')
+        ticks = len(gaps)
+        await async_wait_until(lambda: len(gaps) >= ticks + 5, timeout=5,
+                               what='the loop to tick during the read')
     finally:
+        release.set()
+        await read
         running = False
-        await task
+        await ticker
     return max(gaps)
 
 
@@ -101,9 +108,11 @@ async def _max_gap(during):
 async def test_process_list_does_not_hold_the_loop(rig, monkeypatch):
     """process-list-does-not-hold-the-loop"""
     connection, ref, params = rig
-    _stub_local_receipt(monkeypatch, connection)
+    barrier, release = threading.Event(), threading.Event()
+    _stub_local_receipt(monkeypatch, connection, barrier=barrier, release=release)
 
-    gap = await _max_gap(lambda: session_ancillary.read(connection, ref, params, kind='processes'))
+    gap = await _max_gap(lambda: session_ancillary.read(connection, ref, params, kind='processes'),
+                         barrier, release)
 
     assert gap < MAX_LOOP_GAP_S, f"the loop stalled {gap:.2f}s on the process.list store read"
 
@@ -112,10 +121,13 @@ async def test_process_list_does_not_hold_the_loop(rig, monkeypatch):
 async def test_subagent_list_does_not_hold_the_loop(rig, monkeypatch):
     """subagent-list-does-not-hold-the-loop"""
     connection, ref, params = rig
-    _stub_local_receipt(monkeypatch, connection, delay=0)
-    monkeypatch.setattr(session_ancillary, '_compression_lineage', _blocked(None, frozenset({SID})))
+    _stub_local_receipt(monkeypatch, connection)
+    barrier, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(session_ancillary, '_compression_lineage',
+                        _blocked(barrier, frozenset({SID}), release))
 
-    gap = await _max_gap(lambda: session_ancillary.read(connection, ref, params, kind='subagents'))
+    gap = await _max_gap(lambda: session_ancillary.read(connection, ref, params, kind='subagents'),
+                         barrier, release)
 
     assert gap < MAX_LOOP_GAP_S, f"the loop stalled {gap:.2f}s on the subagent.list lineage read"
 
@@ -124,8 +136,8 @@ async def test_subagent_list_does_not_hold_the_loop(rig, monkeypatch):
 async def test_steer_lock_free_while_ancillary_store_read_runs(rig, monkeypatch):
     """steer-lock-free-while-ancillary-store-read-runs"""
     connection, ref, params = rig
-    barrier = threading.Event()
-    _stub_local_receipt(monkeypatch, connection, barrier=barrier)
+    barrier, release = threading.Event(), threading.Event()
+    _stub_local_receipt(monkeypatch, connection, barrier=barrier, release=release)
     lock = connection.authority.sessions[SID].event_stream.lock
     held = []
 
@@ -139,9 +151,12 @@ async def test_steer_lock_free_while_ancillary_store_read_runs(rig, monkeypatch)
 
     prober = threading.Thread(target=probe)
     prober.start()
+    read = asyncio.create_task(session_ancillary.read(connection, ref, params, kind='processes'))
     try:
-        await session_ancillary.read(connection, ref, params, kind='processes')
+        await async_wait_until(lambda: held, timeout=5, what='the steer probe to take the lock')
     finally:
+        release.set()
+        await read
         prober.join(5)
     acquired, waited = held[0]
     assert acquired
@@ -152,7 +167,7 @@ async def test_steer_lock_free_while_ancillary_store_read_runs(rig, monkeypatch)
 async def test_ancillary_payloads_unchanged(rig, monkeypatch):
     """ancillary-payloads-unchanged: the prefetch moves the reads, never the projection."""
     connection, ref, params = rig
-    _stub_local_receipt(monkeypatch, connection, delay=0)
+    _stub_local_receipt(monkeypatch, connection)
     monkeypatch.setattr(session_ancillary, '_compression_lineage', lambda *_a, **_k: frozenset({SID}))
     process = SimpleNamespace(id='p-1', command='echo hi', exited=False, exit_code=None,
                               started_at=1.0, exited_at=None, completion_reason=None,
