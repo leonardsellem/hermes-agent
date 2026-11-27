@@ -31,10 +31,9 @@ import { hasPasteChip } from '../domain/pasteExpand.js'
 import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import { useGitBranch } from '../hooks/useGitBranch.js'
-import { pruneVirtualHeightCache, useVirtualHistory } from '../hooks/useVirtualHistory.js'
+import { useVirtualHistory } from '../hooks/useVirtualHistory.js'
 import { t } from '../i18n/runtime.js'
 import { useT } from '../i18n/useT.js'
-import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage, capTranscriptHistory } from '../lib/messages.js'
 import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../lib/platform.js'
 import { createResizeCoalescer } from '../lib/resizeCoalescer.js'
@@ -53,7 +52,7 @@ import { createServerRequestHandler } from './createServerRequestHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
-import { type GatewayRpc, type SlashHandler, type StateSetter, type TranscriptRow, type UiState } from './interfaces.js'
+import { type GatewayRpc, type SlashHandler, type StateSetter, type TranscriptRow } from './interfaces.js'
 import { applyLiveSessionRoster } from './liveSessions.js'
 import { applyControlSnapshot } from './loopStatus.js'
 import { $overlayState, capturePromptResponseGuard, hasSensitivePrompt, patchOverlayState } from './overlayStore.js'
@@ -74,6 +73,7 @@ import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
 import { shouldDetachEditedHistoryInput, useInputHandlers } from './useInputHandlers.js'
 import { useLongRunToolCharms } from './useLongRunToolCharms.js'
+import { useTranscriptLayout } from './useMainApp/transcriptLayout.js'
 import {
   backendGaveUp,
   backendGaveUpActivity,
@@ -88,7 +88,6 @@ import { useSubmission } from './useSubmission.js'
 
 const BRACKET_PASTE_ON = '\x1b[?2004h'
 const BRACKET_PASTE_OFF = '\x1b[?2004l'
-const MAX_HEIGHT_CACHE_BUCKETS = 12
 
 interface ExitClose {
   close: () => Promise<void>
@@ -151,20 +150,6 @@ const statusColorOf = (status: string, t: { error: string; muted: string; ok: st
 }
 
 type SubmitLiteral = (value: string, attachments?: Array<{ path: string; mime: string }>) => void
-
-/** Which transcript detail sections render, derived from the `thinking:tools` layout key. */
-const detailsVisibility = (detailsLayoutKey: string, ui: Pick<UiState, 'detailsModeCommandOverride' | 'sections'>) => {
-  const [thinkingDetailsMode, toolsDetailsMode] = detailsLayoutKey.split(':')
-  const thinkingDetailsVisible = thinkingDetailsMode !== 'hidden'
-  const toolsDetailsVisible = toolsDetailsMode !== 'hidden'
-
-  const historyThinkingExpanded =
-    thinkingDetailsVisible && (ui.detailsModeCommandOverride || ui.sections.thinking === 'expanded')
-
-  const detailsVisible = thinkingDetailsVisible || toolsDetailsVisible
-
-  return { detailsVisible, historyThinkingExpanded, thinkingDetailsVisible, toolsDetailsVisible }
-}
 
 export interface PromptLiveSessionOptions {
   dispatchSubmission: (full: string, destination: SubmissionDestination) => void
@@ -258,17 +243,6 @@ export async function startPromptLiveSession({
   dispatchSubmission(trimmed, destination)
 
   return sid
-}
-
-// One bucket per layout that changes row heights (width, prompt, compact, inline images, details).
-function heightCacheBucket(
-  ui: { compact?: boolean; inlineImages?: boolean; sid?: null | string; theme: { brand: { prompt: string } } },
-  cols: number,
-  detailsLayoutKey: string
-): string {
-  const flags = `${ui.compact ? '1' : '0'}:${ui.inlineImages ? '1' : '0'}`
-
-  return `${ui.sid ?? 'draft'}:${cols}:${composerPromptWidth(ui.theme.brand.prompt)}:${flags}:${detailsLayoutKey}`
 }
 
 // 0 is a real measurement (a row that draws nothing), never a miss.
@@ -384,7 +358,6 @@ export function useMainApp(gw: GatewayClient) {
   const gaveUpRef = useRef(false)
   const msgIdsRef = useRef(new WeakMap<Msg, string>())
   const msgIdSeqRef = useRef(0)
-  const heightCachesRef = useRef(new Map<string, Map<string, number>>())
 
   colsRef.current = cols
   historyItemsRef.current = historyItems
@@ -495,34 +468,8 @@ export function useMainApp(gw: GatewayClient) {
     [cols, historyItems, messageId]
   )
 
-  const detailsLayoutKey = useMemo(() => {
-    const thinking = sectionMode('thinking', ui.detailsMode, ui.sections, ui.detailsModeCommandOverride)
-    const tools = sectionMode('tools', ui.detailsMode, ui.sections, ui.detailsModeCommandOverride)
-
-    return `${thinking}:${tools}`
-  }, [ui.detailsMode, ui.detailsModeCommandOverride, ui.sections])
-
-  const { detailsVisible, historyThinkingExpanded, thinkingDetailsVisible, toolsDetailsVisible } = detailsVisibility(
-    detailsLayoutKey,
-    ui
-  )
-
-  const heightCacheKey = heightCacheBucket(ui, cols, detailsLayoutKey)
-
-  // Build a render-local snapshot. Registering/pruning the shared cache is a
-  // post-commit transition below, so an abandoned concurrent render cannot
-  // delete heights still owned by the committed transcript generation.
-  const activeHeightCache = useMemo(() => new Map(heightCachesRef.current.get(heightCacheKey)), [heightCacheKey])
-
-  useEffect(() => {
-    pruneVirtualHeightCache(activeHeightCache, virtualRows)
-    heightCachesRef.current.delete(heightCacheKey)
-    heightCachesRef.current.set(heightCacheKey, activeHeightCache)
-
-    while (heightCachesRef.current.size > MAX_HEIGHT_CACHE_BUCKETS) {
-      heightCachesRef.current.delete(heightCachesRef.current.keys().next().value!)
-    }
-  }, [activeHeightCache, heightCacheKey, historyGeneration, virtualRows])
+  const { activeHeightCache, detailsVisible, historyThinkingExpanded, thinkingDetailsVisible, toolsDetailsVisible } =
+    useTranscriptLayout(ui, cols, virtualRows, historyGeneration)
 
   // Index of the first user-role message — separator-rendering in
   // appLayout.tsx skips this row, so the height estimator must skip it
